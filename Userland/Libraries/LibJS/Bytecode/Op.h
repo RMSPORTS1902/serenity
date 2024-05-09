@@ -18,6 +18,7 @@
 #include <LibJS/Bytecode/Operand.h>
 #include <LibJS/Bytecode/RegexTable.h>
 #include <LibJS/Bytecode/Register.h>
+#include <LibJS/Bytecode/ScopedOperand.h>
 #include <LibJS/Bytecode/StringTable.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/Runtime/Environment.h>
@@ -34,7 +35,7 @@ namespace JS::Bytecode::Op {
 class Mov final : public Instruction {
 public:
     Mov(Operand dst, Operand src)
-        : Instruction(Type::Mov, sizeof(*this))
+        : Instruction(Type::Mov)
         , m_dst(dst)
         , m_src(src)
     {
@@ -81,7 +82,7 @@ private:
     class OpTitleCase final : public Instruction {                          \
     public:                                                                 \
         explicit OpTitleCase(Operand dst, Operand lhs, Operand rhs)         \
-            : Instruction(Type::OpTitleCase, sizeof(*this))                 \
+            : Instruction(Type::OpTitleCase)                                \
             , m_dst(dst)                                                    \
             , m_lhs(lhs)                                                    \
             , m_rhs(rhs)                                                    \
@@ -116,7 +117,7 @@ JS_ENUMERATE_COMMON_BINARY_OPS_WITH_FAST_PATH(JS_DECLARE_COMMON_BINARY_OP)
     class OpTitleCase final : public Instruction {                          \
     public:                                                                 \
         OpTitleCase(Operand dst, Operand src)                               \
-            : Instruction(Type::OpTitleCase, sizeof(*this))                 \
+            : Instruction(Type::OpTitleCase)                                \
             , m_dst(dst)                                                    \
             , m_src(src)                                                    \
         {                                                                   \
@@ -139,7 +140,7 @@ JS_ENUMERATE_COMMON_UNARY_OPS(JS_DECLARE_COMMON_UNARY_OP)
 class NewObject final : public Instruction {
 public:
     explicit NewObject(Operand dst)
-        : Instruction(Type::NewObject, sizeof(*this))
+        : Instruction(Type::NewObject)
         , m_dst(dst)
     {
     }
@@ -156,7 +157,7 @@ private:
 class NewRegExp final : public Instruction {
 public:
     NewRegExp(Operand dst, StringTableIndex source_index, StringTableIndex flags_index, RegexTableIndex regex_index)
-        : Instruction(Type::NewRegExp, sizeof(*this))
+        : Instruction(Type::NewRegExp)
         , m_dst(dst)
         , m_source_index(source_index)
         , m_flags_index(flags_index)
@@ -186,7 +187,7 @@ private:
     class New##ErrorName final : public Instruction {                       \
     public:                                                                 \
         New##ErrorName(Operand dst, StringTableIndex error_string)          \
-            : Instruction(Type::New##ErrorName, sizeof(*this))              \
+            : Instruction(Type::New##ErrorName)                             \
             , m_dst(dst)                                                    \
             , m_error_string(error_string)                                  \
         {                                                                   \
@@ -209,8 +210,10 @@ JS_ENUMERATE_NEW_BUILTIN_ERROR_OPS(JS_DECLARE_NEW_BUILTIN_ERROR_OP)
 // NOTE: This instruction is variable-width depending on the number of excluded names
 class CopyObjectExcludingProperties final : public Instruction {
 public:
-    CopyObjectExcludingProperties(Operand dst, Operand from_object, Vector<Operand> const& excluded_names)
-        : Instruction(Type::CopyObjectExcludingProperties, length_impl(excluded_names.size()))
+    static constexpr bool IsVariableLength = true;
+
+    CopyObjectExcludingProperties(Operand dst, Operand from_object, Vector<ScopedOperand> const& excluded_names)
+        : Instruction(Type::CopyObjectExcludingProperties)
         , m_dst(dst)
         , m_from_object(from_object)
         , m_excluded_names_count(excluded_names.size())
@@ -222,9 +225,9 @@ public:
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
 
-    size_t length_impl(size_t excluded_names_count) const
+    size_t length_impl() const
     {
-        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Operand) * excluded_names_count);
+        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Operand) * m_excluded_names_count);
     }
 
     Operand dst() const { return m_dst; }
@@ -242,20 +245,22 @@ private:
 // NOTE: This instruction is variable-width depending on the number of elements!
 class NewArray final : public Instruction {
 public:
+    static constexpr bool IsVariableLength = true;
+
     explicit NewArray(Operand dst)
-        : Instruction(Type::NewArray, length_impl(0))
+        : Instruction(Type::NewArray)
         , m_dst(dst)
         , m_element_count(0)
     {
     }
 
-    NewArray(Operand dst, AK::Array<Operand, 2> const& elements_range)
-        : Instruction(Type::NewArray, length_impl(elements_range[1].index() - elements_range[0].index() + 1))
+    NewArray(Operand dst, ReadonlySpan<ScopedOperand> elements)
+        : Instruction(Type::NewArray)
         , m_dst(dst)
-        , m_element_count(elements_range[1].index() - elements_range[0].index() + 1)
+        , m_element_count(elements.size())
     {
-        m_elements[0] = elements_range[0];
-        m_elements[1] = elements_range[1];
+        for (size_t i = 0; i < m_element_count; ++i)
+            m_elements[i] = elements[i];
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
@@ -263,21 +268,9 @@ public:
 
     Operand dst() const { return m_dst; }
 
-    size_t length_impl(size_t element_count) const
+    size_t length_impl() const
     {
-        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Operand) * (element_count == 0 ? 0 : 2));
-    }
-
-    Operand start() const
-    {
-        VERIFY(m_element_count);
-        return m_elements[0];
-    }
-
-    Operand end() const
-    {
-        VERIFY(m_element_count);
-        return m_elements[1];
+        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Operand) * m_element_count);
     }
 
     size_t element_count() const { return m_element_count; }
@@ -290,8 +283,10 @@ private:
 
 class NewPrimitiveArray final : public Instruction {
 public:
+    static constexpr bool IsVariableLength = true;
+
     NewPrimitiveArray(Operand dst, ReadonlySpan<Value> elements)
-        : Instruction(Type::NewPrimitiveArray, length_impl(elements.size()))
+        : Instruction(Type::NewPrimitiveArray)
         , m_dst(dst)
         , m_element_count(elements.size())
     {
@@ -299,9 +294,9 @@ public:
             m_elements[i] = elements[i];
     }
 
-    size_t length_impl(size_t element_count) const
+    size_t length_impl() const
     {
-        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Value) * element_count);
+        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Value) * m_element_count);
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
@@ -319,7 +314,7 @@ private:
 class ArrayAppend final : public Instruction {
 public:
     ArrayAppend(Operand dst, Operand src, bool is_spread)
-        : Instruction(Type::ArrayAppend, sizeof(*this))
+        : Instruction(Type::ArrayAppend)
         , m_dst(dst)
         , m_src(src)
         , m_is_spread(is_spread)
@@ -342,7 +337,7 @@ private:
 class ImportCall final : public Instruction {
 public:
     ImportCall(Operand dst, Operand specifier, Operand options)
-        : Instruction(Type::ImportCall, sizeof(*this))
+        : Instruction(Type::ImportCall)
         , m_dst(dst)
         , m_specifier(specifier)
         , m_options(options)
@@ -365,7 +360,7 @@ private:
 class IteratorToArray final : public Instruction {
 public:
     explicit IteratorToArray(Operand dst, Operand iterator)
-        : Instruction(Type::IteratorToArray, sizeof(*this))
+        : Instruction(Type::IteratorToArray)
         , m_dst(dst)
         , m_iterator(iterator)
     {
@@ -385,7 +380,7 @@ private:
 class ConcatString final : public Instruction {
 public:
     explicit ConcatString(Operand dst, Operand src)
-        : Instruction(Type::ConcatString, sizeof(*this))
+        : Instruction(Type::ConcatString)
         , m_dst(dst)
         , m_src(src)
     {
@@ -410,7 +405,7 @@ enum class EnvironmentMode {
 class CreateLexicalEnvironment final : public Instruction {
 public:
     explicit CreateLexicalEnvironment()
-        : Instruction(Type::CreateLexicalEnvironment, sizeof(*this))
+        : Instruction(Type::CreateLexicalEnvironment)
     {
     }
 
@@ -421,7 +416,7 @@ public:
 class EnterObjectEnvironment final : public Instruction {
 public:
     explicit EnterObjectEnvironment(Operand object)
-        : Instruction(Type::EnterObjectEnvironment, sizeof(*this))
+        : Instruction(Type::EnterObjectEnvironment)
         , m_object(object)
     {
     }
@@ -438,7 +433,7 @@ private:
 class Catch final : public Instruction {
 public:
     explicit Catch(Operand dst)
-        : Instruction(Type::Catch, sizeof(*this))
+        : Instruction(Type::Catch)
         , m_dst(dst)
     {
     }
@@ -455,7 +450,7 @@ private:
 class LeaveFinally final : public Instruction {
 public:
     explicit LeaveFinally()
-        : Instruction(Type::LeaveFinally, sizeof(*this))
+        : Instruction(Type::LeaveFinally)
     {
     }
 
@@ -466,7 +461,7 @@ public:
 class RestoreScheduledJump final : public Instruction {
 public:
     explicit RestoreScheduledJump()
-        : Instruction(Type::RestoreScheduledJump, sizeof(*this))
+        : Instruction(Type::RestoreScheduledJump)
     {
     }
 
@@ -477,7 +472,7 @@ public:
 class CreateVariable final : public Instruction {
 public:
     explicit CreateVariable(IdentifierTableIndex identifier, EnvironmentMode mode, bool is_immutable, bool is_global = false, bool is_strict = false)
-        : Instruction(Type::CreateVariable, sizeof(*this))
+        : Instruction(Type::CreateVariable)
         , m_identifier(identifier)
         , m_mode(mode)
         , m_is_immutable(is_immutable)
@@ -510,7 +505,7 @@ public:
         Set,
     };
     explicit SetVariable(IdentifierTableIndex identifier, Operand src, u32 cache_index, InitializationMode initialization_mode = InitializationMode::Set, EnvironmentMode mode = EnvironmentMode::Lexical)
-        : Instruction(Type::SetVariable, sizeof(*this))
+        : Instruction(Type::SetVariable)
         , m_identifier(identifier)
         , m_src(src)
         , m_mode(mode)
@@ -539,7 +534,7 @@ private:
 class SetLocal final : public Instruction {
 public:
     SetLocal(size_t index, Operand src)
-        : Instruction(Type::SetLocal, sizeof(*this))
+        : Instruction(Type::SetLocal)
         , m_index(index)
         , m_src(src)
     {
@@ -548,19 +543,19 @@ public:
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
 
-    size_t index() const { return m_index; }
+    u32 index() const { return m_index; }
     Operand dst() const { return Operand(Operand::Type::Local, m_index); }
     Operand src() const { return m_src; }
 
 private:
-    size_t m_index;
+    u32 m_index;
     Operand m_src;
 };
 
 class GetCalleeAndThisFromEnvironment final : public Instruction {
 public:
     explicit GetCalleeAndThisFromEnvironment(Operand callee, Operand this_value, IdentifierTableIndex identifier, u32 cache_index)
-        : Instruction(Type::GetCalleeAndThisFromEnvironment, sizeof(*this))
+        : Instruction(Type::GetCalleeAndThisFromEnvironment)
         , m_identifier(identifier)
         , m_callee(callee)
         , m_this_value(this_value)
@@ -586,7 +581,7 @@ private:
 class GetVariable final : public Instruction {
 public:
     explicit GetVariable(Operand dst, IdentifierTableIndex identifier, u32 cache_index)
-        : Instruction(Type::GetVariable, sizeof(*this))
+        : Instruction(Type::GetVariable)
         , m_dst(dst)
         , m_identifier(identifier)
         , m_cache_index(cache_index)
@@ -609,7 +604,7 @@ private:
 class GetGlobal final : public Instruction {
 public:
     GetGlobal(Operand dst, IdentifierTableIndex identifier, u32 cache_index)
-        : Instruction(Type::GetGlobal, sizeof(*this))
+        : Instruction(Type::GetGlobal)
         , m_dst(dst)
         , m_identifier(identifier)
         , m_cache_index(cache_index)
@@ -632,7 +627,7 @@ private:
 class DeleteVariable final : public Instruction {
 public:
     explicit DeleteVariable(Operand dst, IdentifierTableIndex identifier)
-        : Instruction(Type::DeleteVariable, sizeof(*this))
+        : Instruction(Type::DeleteVariable)
         , m_dst(dst)
         , m_identifier(identifier)
     {
@@ -652,7 +647,7 @@ private:
 class GetById final : public Instruction {
 public:
     GetById(Operand dst, Operand base, IdentifierTableIndex property, Optional<IdentifierTableIndex> base_identifier, u32 cache_index)
-        : Instruction(Type::GetById, sizeof(*this))
+        : Instruction(Type::GetById)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -680,7 +675,7 @@ private:
 class GetByIdWithThis final : public Instruction {
 public:
     GetByIdWithThis(Operand dst, Operand base, IdentifierTableIndex property, Operand this_value, u32 cache_index)
-        : Instruction(Type::GetByIdWithThis, sizeof(*this))
+        : Instruction(Type::GetByIdWithThis)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -709,7 +704,7 @@ private:
 class GetPrivateById final : public Instruction {
 public:
     explicit GetPrivateById(Operand dst, Operand base, IdentifierTableIndex property)
-        : Instruction(Type::GetPrivateById, sizeof(*this))
+        : Instruction(Type::GetPrivateById)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -732,7 +727,7 @@ private:
 class HasPrivateId final : public Instruction {
 public:
     HasPrivateId(Operand dst, Operand base, IdentifierTableIndex property)
-        : Instruction(Type::HasPrivateId, sizeof(*this))
+        : Instruction(Type::HasPrivateId)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -764,7 +759,7 @@ enum class PropertyKind {
 class PutById final : public Instruction {
 public:
     explicit PutById(Operand base, IdentifierTableIndex property, Operand src, PropertyKind kind, u32 cache_index, Optional<IdentifierTableIndex> base_identifier = {})
-        : Instruction(Type::PutById, sizeof(*this))
+        : Instruction(Type::PutById)
         , m_base(base)
         , m_property(property)
         , m_src(src)
@@ -795,7 +790,7 @@ private:
 class PutByIdWithThis final : public Instruction {
 public:
     PutByIdWithThis(Operand base, Operand this_value, IdentifierTableIndex property, Operand src, PropertyKind kind, u32 cache_index)
-        : Instruction(Type::PutByIdWithThis, sizeof(*this))
+        : Instruction(Type::PutByIdWithThis)
         , m_base(base)
         , m_this_value(this_value)
         , m_property(property)
@@ -827,7 +822,7 @@ private:
 class PutPrivateById final : public Instruction {
 public:
     explicit PutPrivateById(Operand base, IdentifierTableIndex property, Operand src, PropertyKind kind = PropertyKind::KeyValue)
-        : Instruction(Type::PutPrivateById, sizeof(*this))
+        : Instruction(Type::PutPrivateById)
         , m_base(base)
         , m_property(property)
         , m_src(src)
@@ -852,7 +847,7 @@ private:
 class DeleteById final : public Instruction {
 public:
     explicit DeleteById(Operand dst, Operand base, IdentifierTableIndex property)
-        : Instruction(Type::DeleteById, sizeof(*this))
+        : Instruction(Type::DeleteById)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -875,7 +870,7 @@ private:
 class DeleteByIdWithThis final : public Instruction {
 public:
     DeleteByIdWithThis(Operand dst, Operand base, Operand this_value, IdentifierTableIndex property)
-        : Instruction(Type::DeleteByIdWithThis, sizeof(*this))
+        : Instruction(Type::DeleteByIdWithThis)
         , m_dst(dst)
         , m_base(base)
         , m_this_value(this_value)
@@ -901,7 +896,7 @@ private:
 class GetByValue final : public Instruction {
 public:
     GetByValue(Operand dst, Operand base, Operand property, Optional<IdentifierTableIndex> base_identifier = {})
-        : Instruction(Type::GetByValue, sizeof(*this))
+        : Instruction(Type::GetByValue)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -928,7 +923,7 @@ private:
 class GetByValueWithThis final : public Instruction {
 public:
     GetByValueWithThis(Operand dst, Operand base, Operand property, Operand this_value)
-        : Instruction(Type::GetByValueWithThis, sizeof(*this))
+        : Instruction(Type::GetByValueWithThis)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -954,7 +949,7 @@ private:
 class PutByValue final : public Instruction {
 public:
     PutByValue(Operand base, Operand property, Operand src, PropertyKind kind = PropertyKind::KeyValue, Optional<IdentifierTableIndex> base_identifier = {})
-        : Instruction(Type::PutByValue, sizeof(*this))
+        : Instruction(Type::PutByValue)
         , m_base(base)
         , m_property(property)
         , m_src(src)
@@ -982,7 +977,7 @@ private:
 class PutByValueWithThis final : public Instruction {
 public:
     PutByValueWithThis(Operand base, Operand property, Operand this_value, Operand src, PropertyKind kind = PropertyKind::KeyValue)
-        : Instruction(Type::PutByValueWithThis, sizeof(*this))
+        : Instruction(Type::PutByValueWithThis)
         , m_base(base)
         , m_property(property)
         , m_this_value(this_value)
@@ -1011,7 +1006,7 @@ private:
 class DeleteByValue final : public Instruction {
 public:
     DeleteByValue(Operand dst, Operand base, Operand property)
-        : Instruction(Type::DeleteByValue, sizeof(*this))
+        : Instruction(Type::DeleteByValue)
         , m_dst(dst)
         , m_base(base)
         , m_property(property)
@@ -1034,7 +1029,7 @@ private:
 class DeleteByValueWithThis final : public Instruction {
 public:
     DeleteByValueWithThis(Operand dst, Operand base, Operand this_value, Operand property)
-        : Instruction(Type::DeleteByValueWithThis, sizeof(*this))
+        : Instruction(Type::DeleteByValueWithThis)
         , m_dst(dst)
         , m_base(base)
         , m_this_value(this_value)
@@ -1057,91 +1052,169 @@ private:
     Operand m_property;
 };
 
-class Jump : public Instruction {
+class Jump final : public Instruction {
 public:
     constexpr static bool IsTerminator = true;
 
-    explicit Jump(Type type, Label taken_target, Optional<Label> nontaken_target = {})
-        : Instruction(type, sizeof(*this))
-        , m_true_target(move(taken_target))
-        , m_false_target(move(nontaken_target))
-    {
-    }
-
-    explicit Jump(Type type, Label taken_target, Label nontaken_target, size_t sizeof_self)
-        : Instruction(type, sizeof_self)
-        , m_true_target(move(taken_target))
-        , m_false_target(move(nontaken_target))
-    {
-    }
-
-    explicit Jump(Label taken_target, Optional<Label> nontaken_target = {})
-        : Instruction(Type::Jump, sizeof(*this))
-        , m_true_target(move(taken_target))
-        , m_false_target(move(nontaken_target))
+    explicit Jump(Label target)
+        : Instruction(Type::Jump)
+        , m_target(target)
     {
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_target);
+    }
 
+    auto& target() const { return m_target; }
+
+protected:
+    Label m_target;
+};
+
+class JumpIf final : public Instruction {
+public:
+    constexpr static bool IsTerminator = true;
+
+    explicit JumpIf(Operand condition, Label true_target, Label false_target)
+        : Instruction(Type::JumpIf)
+        , m_condition(condition)
+        , m_true_target(true_target)
+        , m_false_target(false_target)
+    {
+    }
+
+    ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
+    ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_true_target);
+        visitor(m_false_target);
+    }
+
+    Operand condition() const { return m_condition; }
     auto& true_target() const { return m_true_target; }
     auto& false_target() const { return m_false_target; }
 
-protected:
-    Optional<Label> m_true_target;
-    Optional<Label> m_false_target;
+private:
+    Operand m_condition;
+    Label m_true_target;
+    Label m_false_target;
 };
 
-class JumpIf final : public Jump {
+class JumpTrue final : public Instruction {
 public:
-    explicit JumpIf(Operand condition, Label true_target, Label false_target)
-        : Jump(Type::JumpIf, move(true_target), move(false_target), sizeof(*this))
+    constexpr static bool IsTerminator = true;
+
+    explicit JumpTrue(Operand condition, Label target)
+        : Instruction(Type::JumpTrue)
         , m_condition(condition)
+        , m_target(target)
     {
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_target);
+    }
 
     Operand condition() const { return m_condition; }
+    auto& target() const { return m_target; }
 
 private:
     Operand m_condition;
+    Label m_target;
 };
 
-class JumpNullish final : public Jump {
+class JumpFalse final : public Instruction {
 public:
+    constexpr static bool IsTerminator = true;
+
+    explicit JumpFalse(Operand condition, Label target)
+        : Instruction(Type::JumpFalse)
+        , m_condition(condition)
+        , m_target(target)
+    {
+    }
+
+    ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
+    ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_target);
+    }
+
+    Operand condition() const { return m_condition; }
+    auto& target() const { return m_target; }
+
+private:
+    Operand m_condition;
+    Label m_target;
+};
+
+class JumpNullish final : public Instruction {
+public:
+    constexpr static bool IsTerminator = true;
+
     explicit JumpNullish(Operand condition, Label true_target, Label false_target)
-        : Jump(Type::JumpNullish, move(true_target), move(false_target), sizeof(*this))
+        : Instruction(Type::JumpNullish)
         , m_condition(condition)
+        , m_true_target(true_target)
+        , m_false_target(false_target)
     {
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_true_target);
+        visitor(m_false_target);
+    }
 
     Operand condition() const { return m_condition; }
+    auto& true_target() const { return m_true_target; }
+    auto& false_target() const { return m_false_target; }
 
 private:
     Operand m_condition;
+    Label m_true_target;
+    Label m_false_target;
 };
 
-class JumpUndefined final : public Jump {
+class JumpUndefined final : public Instruction {
 public:
+    constexpr static bool IsTerminator = true;
+
     explicit JumpUndefined(Operand condition, Label true_target, Label false_target)
-        : Jump(Type::JumpUndefined, move(true_target), move(false_target), sizeof(*this))
+        : Instruction(Type::JumpUndefined)
         , m_condition(condition)
+        , m_true_target(true_target)
+        , m_false_target(false_target)
     {
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_true_target);
+        visitor(m_false_target);
+    }
 
     Operand condition() const { return m_condition; }
+    auto& true_target() const { return m_true_target; }
+    auto& false_target() const { return m_false_target; }
 
 private:
     Operand m_condition;
+    Label m_true_target;
+    Label m_false_target;
 };
 
 enum class CallType {
@@ -1152,8 +1225,10 @@ enum class CallType {
 
 class Call final : public Instruction {
 public:
-    Call(CallType type, Operand dst, Operand callee, Operand this_value, ReadonlySpan<Operand> arguments, Optional<StringTableIndex> expression_string = {}, Optional<Builtin> builtin = {})
-        : Instruction(Type::Call, length_impl(arguments.size()))
+    static constexpr bool IsVariableLength = true;
+
+    Call(CallType type, Operand dst, Operand callee, Operand this_value, ReadonlySpan<ScopedOperand> arguments, Optional<StringTableIndex> expression_string = {}, Optional<Builtin> builtin = {})
+        : Instruction(Type::Call)
         , m_dst(dst)
         , m_callee(callee)
         , m_this_value(this_value)
@@ -1166,9 +1241,9 @@ public:
             m_arguments[i] = arguments[i];
     }
 
-    size_t length_impl(size_t argument_count) const
+    size_t length_impl() const
     {
-        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Operand) * argument_count);
+        return round_up_to_power_of_two(alignof(void*), sizeof(*this) + sizeof(Operand) * m_argument_count);
     }
 
     CallType call_type() const { return m_type; }
@@ -1198,7 +1273,7 @@ private:
 class CallWithArgumentArray final : public Instruction {
 public:
     CallWithArgumentArray(CallType type, Operand dst, Operand callee, Operand this_value, Operand arguments, Optional<StringTableIndex> expression_string = {})
-        : Instruction(Type::CallWithArgumentArray, sizeof(*this))
+        : Instruction(Type::CallWithArgumentArray)
         , m_dst(dst)
         , m_callee(callee)
         , m_this_value(this_value)
@@ -1230,7 +1305,7 @@ private:
 class SuperCallWithArgumentArray : public Instruction {
 public:
     explicit SuperCallWithArgumentArray(Operand dst, Operand arguments, bool is_synthetic)
-        : Instruction(Type::SuperCallWithArgumentArray, sizeof(*this))
+        : Instruction(Type::SuperCallWithArgumentArray)
         , m_dst(dst)
         , m_arguments(arguments)
         , m_is_synthetic(is_synthetic)
@@ -1253,7 +1328,7 @@ private:
 class NewClass final : public Instruction {
 public:
     explicit NewClass(Operand dst, Optional<Operand> super_class, ClassExpression const& class_expression, Optional<IdentifierTableIndex> lhs_name)
-        : Instruction(Type::NewClass, sizeof(*this))
+        : Instruction(Type::NewClass)
         , m_dst(dst)
         , m_super_class(super_class)
         , m_class_expression(class_expression)
@@ -1279,7 +1354,7 @@ private:
 class NewFunction final : public Instruction {
 public:
     explicit NewFunction(Operand dst, FunctionExpression const& function_node, Optional<IdentifierTableIndex> lhs_name, Optional<Operand> home_object = {})
-        : Instruction(Type::NewFunction, sizeof(*this))
+        : Instruction(Type::NewFunction)
         , m_dst(dst)
         , m_function_node(function_node)
         , m_lhs_name(lhs_name)
@@ -1305,7 +1380,7 @@ private:
 class BlockDeclarationInstantiation final : public Instruction {
 public:
     explicit BlockDeclarationInstantiation(ScopeNode const& scope_node)
-        : Instruction(Type::BlockDeclarationInstantiation, sizeof(*this))
+        : Instruction(Type::BlockDeclarationInstantiation)
         , m_scope_node(scope_node)
     {
     }
@@ -1324,7 +1399,7 @@ public:
     constexpr static bool IsTerminator = true;
 
     explicit Return(Optional<Operand> value = {})
-        : Instruction(Type::Return, sizeof(*this))
+        : Instruction(Type::Return)
         , m_value(value)
     {
     }
@@ -1341,7 +1416,7 @@ private:
 class Increment final : public Instruction {
 public:
     explicit Increment(Operand dst)
-        : Instruction(Type::Increment, sizeof(*this))
+        : Instruction(Type::Increment)
         , m_dst(dst)
     {
     }
@@ -1358,7 +1433,7 @@ private:
 class PostfixIncrement final : public Instruction {
 public:
     explicit PostfixIncrement(Operand dst, Operand src)
-        : Instruction(Type::PostfixIncrement, sizeof(*this))
+        : Instruction(Type::PostfixIncrement)
         , m_dst(dst)
         , m_src(src)
     {
@@ -1378,7 +1453,7 @@ private:
 class Decrement final : public Instruction {
 public:
     explicit Decrement(Operand dst)
-        : Instruction(Type::Decrement, sizeof(*this))
+        : Instruction(Type::Decrement)
         , m_dst(dst)
     {
     }
@@ -1395,7 +1470,7 @@ private:
 class PostfixDecrement final : public Instruction {
 public:
     explicit PostfixDecrement(Operand dst, Operand src)
-        : Instruction(Type::PostfixDecrement, sizeof(*this))
+        : Instruction(Type::PostfixDecrement)
         , m_dst(dst)
         , m_src(src)
     {
@@ -1417,7 +1492,7 @@ public:
     constexpr static bool IsTerminator = true;
 
     explicit Throw(Operand src)
-        : Instruction(Type::Throw, sizeof(*this))
+        : Instruction(Type::Throw)
         , m_src(src)
     {
     }
@@ -1434,7 +1509,7 @@ private:
 class ThrowIfNotObject final : public Instruction {
 public:
     ThrowIfNotObject(Operand src)
-        : Instruction(Type::ThrowIfNotObject, sizeof(*this))
+        : Instruction(Type::ThrowIfNotObject)
         , m_src(src)
     {
     }
@@ -1451,7 +1526,7 @@ private:
 class ThrowIfNullish final : public Instruction {
 public:
     explicit ThrowIfNullish(Operand src)
-        : Instruction(Type::ThrowIfNullish, sizeof(*this))
+        : Instruction(Type::ThrowIfNullish)
         , m_src(src)
     {
     }
@@ -1468,7 +1543,7 @@ private:
 class ThrowIfTDZ final : public Instruction {
 public:
     explicit ThrowIfTDZ(Operand src)
-        : Instruction(Type::ThrowIfTDZ, sizeof(*this))
+        : Instruction(Type::ThrowIfTDZ)
         , m_src(src)
     {
     }
@@ -1487,13 +1562,17 @@ public:
     constexpr static bool IsTerminator = true;
 
     EnterUnwindContext(Label entry_point)
-        : Instruction(Type::EnterUnwindContext, sizeof(*this))
+        : Instruction(Type::EnterUnwindContext)
         , m_entry_point(move(entry_point))
     {
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_entry_point);
+    }
 
     auto& entry_point() const { return m_entry_point; }
 
@@ -1505,17 +1584,10 @@ class ScheduleJump final : public Instruction {
 public:
     // Note: We use this instruction to tell the next `finally` block to
     //       continue execution with a specific break/continue target;
-    // FIXME: We currently don't clear the interpreter internal flag, when we change
-    //        the control-flow (`break`, `continue`) in a finally-block,
-    // FIXME: .NET on x86_64 uses a call to the finally instead, which could make this
-    //        easier, at the cost of making control-flow changes (`break`, `continue`, `return`)
-    //        in the finally-block more difficult, but as stated above, those
-    //        aren't handled 100% correctly at the moment anyway
-    //        It might be worth investigating a similar mechanism
     constexpr static bool IsTerminator = true;
 
     ScheduleJump(Label target)
-        : Instruction(Type::ScheduleJump, sizeof(*this))
+        : Instruction(Type::ScheduleJump)
         , m_target(target)
     {
     }
@@ -1524,6 +1596,10 @@ public:
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_target);
+    }
 
 private:
     Label m_target;
@@ -1532,7 +1608,7 @@ private:
 class LeaveLexicalEnvironment final : public Instruction {
 public:
     LeaveLexicalEnvironment()
-        : Instruction(Type::LeaveLexicalEnvironment, sizeof(*this))
+        : Instruction(Type::LeaveLexicalEnvironment)
     {
     }
 
@@ -1543,7 +1619,7 @@ public:
 class LeaveUnwindContext final : public Instruction {
 public:
     LeaveUnwindContext()
-        : Instruction(Type::LeaveUnwindContext, sizeof(*this))
+        : Instruction(Type::LeaveUnwindContext)
     {
     }
 
@@ -1556,13 +1632,17 @@ public:
     constexpr static bool IsTerminator = true;
 
     explicit ContinuePendingUnwind(Label resume_target)
-        : Instruction(Type::ContinuePendingUnwind, sizeof(*this))
+        : Instruction(Type::ContinuePendingUnwind)
         , m_resume_target(resume_target)
     {
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_resume_target);
+    }
 
     auto& resume_target() const { return m_resume_target; }
 
@@ -1575,20 +1655,25 @@ public:
     constexpr static bool IsTerminator = true;
 
     explicit Yield(Label continuation_label, Operand value)
-        : Instruction(Type::Yield, sizeof(*this))
+        : Instruction(Type::Yield)
         , m_continuation_label(continuation_label)
         , m_value(value)
     {
     }
 
     explicit Yield(nullptr_t, Operand value)
-        : Instruction(Type::Yield, sizeof(*this))
+        : Instruction(Type::Yield)
         , m_value(value)
     {
     }
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        if (m_continuation_label.has_value())
+            visitor(m_continuation_label.value());
+    }
 
     auto& continuation() const { return m_continuation_label; }
     Operand value() const { return m_value; }
@@ -1603,7 +1688,7 @@ public:
     constexpr static bool IsTerminator = true;
 
     explicit Await(Label continuation_label, Operand argument)
-        : Instruction(Type::Await, sizeof(*this))
+        : Instruction(Type::Await)
         , m_continuation_label(continuation_label)
         , m_argument(argument)
     {
@@ -1611,6 +1696,10 @@ public:
 
     ThrowCompletionOr<void> execute_impl(Bytecode::Interpreter&) const;
     ByteString to_byte_string_impl(Bytecode::Executable const&) const;
+    void visit_labels_impl(Function<void(Label&)> visitor)
+    {
+        visitor(m_continuation_label);
+    }
 
     auto& continuation() const { return m_continuation_label; }
     Operand argument() const { return m_argument; }
@@ -1623,7 +1712,7 @@ private:
 class GetIterator final : public Instruction {
 public:
     GetIterator(Operand dst, Operand iterable, IteratorHint hint = IteratorHint::Sync)
-        : Instruction(Type::GetIterator, sizeof(*this))
+        : Instruction(Type::GetIterator)
         , m_dst(dst)
         , m_iterable(iterable)
         , m_hint(hint)
@@ -1646,7 +1735,7 @@ private:
 class GetObjectFromIteratorRecord final : public Instruction {
 public:
     GetObjectFromIteratorRecord(Operand object, Operand iterator_record)
-        : Instruction(Type::GetObjectFromIteratorRecord, sizeof(*this))
+        : Instruction(Type::GetObjectFromIteratorRecord)
         , m_object(object)
         , m_iterator_record(iterator_record)
     {
@@ -1666,7 +1755,7 @@ private:
 class GetNextMethodFromIteratorRecord final : public Instruction {
 public:
     GetNextMethodFromIteratorRecord(Operand next_method, Operand iterator_record)
-        : Instruction(Type::GetNextMethodFromIteratorRecord, sizeof(*this))
+        : Instruction(Type::GetNextMethodFromIteratorRecord)
         , m_next_method(next_method)
         , m_iterator_record(iterator_record)
     {
@@ -1686,7 +1775,7 @@ private:
 class GetMethod final : public Instruction {
 public:
     GetMethod(Operand dst, Operand object, IdentifierTableIndex property)
-        : Instruction(Type::GetMethod, sizeof(*this))
+        : Instruction(Type::GetMethod)
         , m_dst(dst)
         , m_object(object)
         , m_property(property)
@@ -1709,7 +1798,7 @@ private:
 class GetObjectPropertyIterator final : public Instruction {
 public:
     GetObjectPropertyIterator(Operand dst, Operand object)
-        : Instruction(Type::GetObjectPropertyIterator, sizeof(*this))
+        : Instruction(Type::GetObjectPropertyIterator)
         , m_dst(dst)
         , m_object(object)
     {
@@ -1729,7 +1818,7 @@ private:
 class IteratorClose final : public Instruction {
 public:
     IteratorClose(Operand iterator_record, Completion::Type completion_type, Optional<Value> completion_value)
-        : Instruction(Type::IteratorClose, sizeof(*this))
+        : Instruction(Type::IteratorClose)
         , m_iterator_record(iterator_record)
         , m_completion_type(completion_type)
         , m_completion_value(completion_value)
@@ -1752,7 +1841,7 @@ private:
 class AsyncIteratorClose final : public Instruction {
 public:
     AsyncIteratorClose(Operand iterator_record, Completion::Type completion_type, Optional<Value> completion_value)
-        : Instruction(Type::AsyncIteratorClose, sizeof(*this))
+        : Instruction(Type::AsyncIteratorClose)
         , m_iterator_record(iterator_record)
         , m_completion_type(completion_type)
         , m_completion_value(completion_value)
@@ -1775,7 +1864,7 @@ private:
 class IteratorNext final : public Instruction {
 public:
     IteratorNext(Operand dst, Operand iterator_record)
-        : Instruction(Type::IteratorNext, sizeof(*this))
+        : Instruction(Type::IteratorNext)
         , m_dst(dst)
         , m_iterator_record(iterator_record)
     {
@@ -1795,7 +1884,7 @@ private:
 class ResolveThisBinding final : public Instruction {
 public:
     explicit ResolveThisBinding(Operand dst)
-        : Instruction(Type::ResolveThisBinding, sizeof(*this))
+        : Instruction(Type::ResolveThisBinding)
         , m_dst(dst)
     {
     }
@@ -1812,7 +1901,7 @@ private:
 class ResolveSuperBase final : public Instruction {
 public:
     explicit ResolveSuperBase(Operand dst)
-        : Instruction(Type::ResolveSuperBase, sizeof(*this))
+        : Instruction(Type::ResolveSuperBase)
         , m_dst(dst)
     {
     }
@@ -1829,7 +1918,7 @@ private:
 class GetNewTarget final : public Instruction {
 public:
     explicit GetNewTarget(Operand dst)
-        : Instruction(Type::GetNewTarget, sizeof(*this))
+        : Instruction(Type::GetNewTarget)
         , m_dst(dst)
     {
     }
@@ -1846,7 +1935,7 @@ private:
 class GetImportMeta final : public Instruction {
 public:
     explicit GetImportMeta(Operand dst)
-        : Instruction(Type::GetImportMeta, sizeof(*this))
+        : Instruction(Type::GetImportMeta)
         , m_dst(dst)
     {
     }
@@ -1863,7 +1952,7 @@ private:
 class TypeofVariable final : public Instruction {
 public:
     TypeofVariable(Operand dst, IdentifierTableIndex identifier)
-        : Instruction(Type::TypeofVariable, sizeof(*this))
+        : Instruction(Type::TypeofVariable)
         , m_dst(dst)
         , m_identifier(identifier)
     {
@@ -1885,7 +1974,7 @@ public:
     constexpr static bool IsTerminator = true;
 
     explicit End(Operand value)
-        : Instruction(Type::End, sizeof(*this))
+        : Instruction(Type::End)
         , m_value(value)
     {
     }
@@ -1902,7 +1991,7 @@ private:
 class Dump final : public Instruction {
 public:
     explicit Dump(StringView text, Operand value)
-        : Instruction(Type::Dump, sizeof(*this))
+        : Instruction(Type::Dump)
         , m_text(text)
         , m_value(value)
     {

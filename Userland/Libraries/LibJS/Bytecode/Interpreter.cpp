@@ -86,7 +86,7 @@ static ByteString format_operand_list(StringView name, ReadonlySpan<Operand> ope
 {
     StringBuilder builder;
     if (!name.is_empty())
-        builder.appendff(", \033[32m{}\033[0m:[", name);
+        builder.appendff("\033[32m{}\033[0m:[", name);
     for (size_t i = 0; i < operands.size(); ++i) {
         if (i != 0)
             builder.append(", "sv);
@@ -100,7 +100,7 @@ static ByteString format_value_list(StringView name, ReadonlySpan<Value> values)
 {
     StringBuilder builder;
     if (!name.is_empty())
-        builder.appendff(", \033[32m{}\033[0m:[", name);
+        builder.appendff("\033[32m{}\033[0m:[", name);
     builder.join(", "sv, values);
     builder.append("]"sv);
     return builder.to_byte_string();
@@ -157,7 +157,7 @@ ALWAYS_INLINE Value Interpreter::get(Operand op) const
     case Operand::Type::Register:
         return reg(Register { op.index() });
     case Operand::Type::Local:
-        return vm().running_execution_context().locals[op.index()];
+        return m_locals.data()[op.index()];
     case Operand::Type::Constant:
         return current_executable().constants[op.index()];
     }
@@ -171,7 +171,7 @@ ALWAYS_INLINE void Interpreter::set(Operand op, Value value)
         reg(Register { op.index() }) = value;
         return;
     case Operand::Type::Local:
-        vm().running_execution_context().locals[op.index()] = value;
+        m_locals.data()[op.index()] = value;
         return;
     case Operand::Type::Constant:
         VERIFY_NOT_REACHED();
@@ -244,7 +244,7 @@ ThrowCompletionOr<Value> Interpreter::run(Script& script_record, JS::GCPtr<Envir
                 executable->dump();
 
             // a. Set result to the result of evaluating script.
-            auto result_or_error = run_executable(*executable, nullptr);
+            auto result_or_error = run_executable(*executable, {}, {});
             if (result_or_error.value.is_error())
                 result = result_or_error.value.release_error();
             else
@@ -304,116 +304,339 @@ ThrowCompletionOr<Value> Interpreter::run(SourceTextModule& module)
     return js_undefined();
 }
 
-void Interpreter::run_bytecode()
+Interpreter::HandleExceptionResponse Interpreter::handle_exception(size_t& program_counter, Value exception)
 {
-    auto* locals = vm().running_execution_context().locals.data();
+    reg(Register::exception()) = exception;
+    m_scheduled_jump = {};
+    auto handlers = current_executable().exception_handlers_for_offset(program_counter);
+    if (!handlers.has_value()) {
+        return HandleExceptionResponse::ExitFromExecutable;
+    }
+    auto& handler = handlers->handler_offset;
+    auto& finalizer = handlers->finalizer_offset;
+
+    VERIFY(!vm().running_execution_context().unwind_contexts.is_empty());
+    auto& unwind_context = vm().running_execution_context().unwind_contexts.last();
+    VERIFY(unwind_context.executable == m_current_executable);
+
+    if (handler.has_value()) {
+        program_counter = handler.value();
+        return HandleExceptionResponse::ContinueInThisExecutable;
+    }
+    if (finalizer.has_value()) {
+        program_counter = finalizer.value();
+        return HandleExceptionResponse::ContinueInThisExecutable;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+// FIXME: GCC takes a *long* time to compile with flattening, and it will time out our CI. :|
+#if defined(AK_COMPILER_CLANG)
+#    define FLATTEN_ON_CLANG FLATTEN
+#else
+#    define FLATTEN_ON_CLANG
+#endif
+
+FLATTEN_ON_CLANG void Interpreter::run_bytecode(size_t entry_point)
+{
+    if (vm().did_reach_stack_space_limit()) {
+        reg(Register::exception()) = vm().throw_completion<InternalError>(ErrorType::CallStackSizeExceeded).release_value().value();
+        return;
+    }
+
+    auto& running_execution_context = vm().running_execution_context();
+    auto* locals = running_execution_context.locals.data();
     auto& accumulator = this->accumulator();
+    auto& executable = current_executable();
+    auto const* bytecode = executable.bytecode.data();
+
+    size_t program_counter = entry_point;
+
+    TemporaryChange change(m_program_counter, Optional<size_t&>(program_counter));
+
+    // Declare a lookup table for computed goto with each of the `handle_*` labels
+    // to avoid the overhead of a switch statement.
+    // This is a GCC extension, but it's also supported by Clang.
+
+    static void* const bytecode_dispatch_table[] = {
+#define SET_UP_LABEL(name) &&handle_##name,
+        ENUMERATE_BYTECODE_OPS(SET_UP_LABEL)
+    };
+
+#define DISPATCH_NEXT(name)                                                                         \
+    do {                                                                                            \
+        if constexpr (Op::name::IsVariableLength)                                                   \
+            program_counter += instruction.length();                                                \
+        else                                                                                        \
+            program_counter += sizeof(Op::name);                                                    \
+        auto& next_instruction = *reinterpret_cast<Instruction const*>(&bytecode[program_counter]); \
+        goto* bytecode_dispatch_table[static_cast<size_t>(next_instruction.type())];                \
+    } while (0)
+
     for (;;) {
     start:
-        auto pc = InstructionStreamIterator { m_current_block->instruction_stream(), m_current_executable };
-        TemporaryChange temp_change { m_pc, Optional<InstructionStreamIterator&>(pc) };
-
         bool will_return = false;
         bool will_yield = false;
 
-        ThrowCompletionOr<void> result;
+        for (;;) {
+            goto* bytecode_dispatch_table[static_cast<size_t>((*reinterpret_cast<Instruction const*>(&bytecode[program_counter])).type())];
 
-        while (!pc.at_end()) {
-            auto& instruction = *pc;
+        handle_SetLocal: {
+            auto& instruction = *reinterpret_cast<Op::SetLocal const*>(&bytecode[program_counter]);
+            locals[instruction.index()] = get(instruction.src());
+            DISPATCH_NEXT(SetLocal);
+        }
 
-            switch (instruction.type()) {
-            case Instruction::Type::SetLocal:
-                locals[static_cast<Op::SetLocal const&>(instruction).index()] = get(static_cast<Op::SetLocal const&>(instruction).src());
-                break;
-            case Instruction::Type::Mov:
-                set(static_cast<Op::Mov const&>(instruction).dst(), get(static_cast<Op::Mov const&>(instruction).src()));
-                break;
-            case Instruction::Type::End:
-                accumulator = get(static_cast<Op::End const&>(instruction).value());
-                return;
-            case Instruction::Type::Jump:
-                m_current_block = &static_cast<Op::Jump const&>(instruction).true_target()->block();
-                goto start;
-            case Instruction::Type::JumpIf:
-                if (get(static_cast<Op::JumpIf const&>(instruction).condition()).to_boolean())
-                    m_current_block = &static_cast<Op::JumpIf const&>(instruction).true_target()->block();
-                else
-                    m_current_block = &static_cast<Op::JumpIf const&>(instruction).false_target()->block();
-                goto start;
-            case Instruction::Type::JumpNullish:
-                if (get(static_cast<Op::JumpNullish const&>(instruction).condition()).is_nullish())
-                    m_current_block = &static_cast<Op::Jump const&>(instruction).true_target()->block();
-                else
-                    m_current_block = &static_cast<Op::Jump const&>(instruction).false_target()->block();
-                goto start;
-            case Instruction::Type::JumpUndefined:
-                if (get(static_cast<Op::JumpUndefined const&>(instruction).condition()).is_undefined())
-                    m_current_block = &static_cast<Op::Jump const&>(instruction).true_target()->block();
-                else
-                    m_current_block = &static_cast<Op::Jump const&>(instruction).false_target()->block();
-                goto start;
-            case Instruction::Type::EnterUnwindContext:
-                enter_unwind_context();
-                m_current_block = &static_cast<Op::EnterUnwindContext const&>(instruction).entry_point().block();
-                goto start;
-            case Instruction::Type::ContinuePendingUnwind: {
-                if (auto exception = reg(Register::exception()); !exception.is_empty()) {
-                    result = throw_completion(exception);
-                    break;
-                }
-                if (!saved_return_value().is_empty()) {
-                    do_return(saved_return_value());
-                    break;
-                }
-                auto& running_execution_context = vm().running_execution_context();
-                auto const* old_scheduled_jump = running_execution_context.previously_scheduled_jumps.take_last();
-                if (m_scheduled_jump) {
-                    m_current_block = exchange(m_scheduled_jump, nullptr);
-                } else {
-                    m_current_block = &static_cast<Op::ContinuePendingUnwind const&>(instruction).resume_target().block();
-                    // set the scheduled jump to the old value if we continue
-                    // where we left it
-                    m_scheduled_jump = old_scheduled_jump;
-                }
+        handle_Mov: {
+            auto& instruction = *reinterpret_cast<Op::Mov const*>(&bytecode[program_counter]);
+            set(instruction.dst(), get(instruction.src()));
+            DISPATCH_NEXT(Mov);
+        }
+
+        handle_End: {
+            auto& instruction = *reinterpret_cast<Op::End const*>(&bytecode[program_counter]);
+            accumulator = get(instruction.value());
+            return;
+        }
+
+        handle_Jump: {
+            auto& instruction = *reinterpret_cast<Op::Jump const*>(&bytecode[program_counter]);
+            program_counter = instruction.target().address();
+            goto start;
+        }
+
+        handle_JumpIf: {
+            auto& instruction = *reinterpret_cast<Op::JumpIf const*>(&bytecode[program_counter]);
+            if (get(instruction.condition()).to_boolean())
+                program_counter = instruction.true_target().address();
+            else
+                program_counter = instruction.false_target().address();
+            goto start;
+        }
+
+        handle_JumpTrue: {
+            auto& instruction = *reinterpret_cast<Op::JumpTrue const*>(&bytecode[program_counter]);
+            if (get(instruction.condition()).to_boolean()) {
+                program_counter = instruction.target().address();
                 goto start;
             }
-            case Instruction::Type::ScheduleJump: {
-                m_scheduled_jump = &static_cast<Op::ScheduleJump const&>(instruction).target().block();
-                auto const* finalizer = m_current_block->finalizer();
-                VERIFY(finalizer);
-                m_current_block = finalizer;
+            DISPATCH_NEXT(JumpTrue);
+        }
+
+        handle_JumpFalse: {
+            auto& instruction = *reinterpret_cast<Op::JumpFalse const*>(&bytecode[program_counter]);
+            if (!get(instruction.condition()).to_boolean()) {
+                program_counter = instruction.target().address();
                 goto start;
             }
-            default:
-                result = instruction.execute(*this);
-                break;
-            }
+            DISPATCH_NEXT(JumpFalse);
+        }
 
-            if (result.is_error()) [[unlikely]] {
-                reg(Register::exception()) = *result.throw_completion().value();
-                m_scheduled_jump = {};
-                auto const* handler = m_current_block->handler();
-                auto const* finalizer = m_current_block->finalizer();
-                if (!handler && !finalizer)
+        handle_JumpNullish: {
+            auto& instruction = *reinterpret_cast<Op::JumpNullish const*>(&bytecode[program_counter]);
+            if (get(instruction.condition()).is_nullish())
+                program_counter = instruction.true_target().address();
+            else
+                program_counter = instruction.false_target().address();
+            goto start;
+        }
+
+        handle_JumpUndefined: {
+            auto& instruction = *reinterpret_cast<Op::JumpUndefined const*>(&bytecode[program_counter]);
+            if (get(instruction.condition()).is_undefined())
+                program_counter = instruction.true_target().address();
+            else
+                program_counter = instruction.false_target().address();
+            goto start;
+        }
+
+        handle_EnterUnwindContext: {
+            auto& instruction = *reinterpret_cast<Op::EnterUnwindContext const*>(&bytecode[program_counter]);
+            enter_unwind_context();
+            program_counter = instruction.entry_point().address();
+            goto start;
+        }
+
+        handle_ContinuePendingUnwind: {
+            auto& instruction = *reinterpret_cast<Op::ContinuePendingUnwind const*>(&bytecode[program_counter]);
+            if (auto exception = reg(Register::exception()); !exception.is_empty()) {
+                if (handle_exception(program_counter, exception) == HandleExceptionResponse::ExitFromExecutable)
                     return;
-
-                auto& running_execution_context = vm().running_execution_context();
-                auto& unwind_context = running_execution_context.unwind_contexts.last();
-                VERIFY(unwind_context.executable == m_current_executable);
-
-                if (handler) {
-                    m_current_block = handler;
-                    goto start;
-                }
-                if (finalizer) {
-                    m_current_block = finalizer;
-                    goto start;
-                }
-                // An unwind context with no handler or finalizer? We have nowhere to jump, and continuing on will make us crash on the next `Call` to a non-native function if there's an exception! So let's crash here instead.
-                // If you run into this, you probably forgot to remove the current unwind_context somewhere.
-                VERIFY_NOT_REACHED();
+                goto start;
             }
+            if (!saved_return_value().is_empty()) {
+                do_return(saved_return_value());
+                goto may_return;
+            }
+            auto const old_scheduled_jump = running_execution_context.previously_scheduled_jumps.take_last();
+            if (m_scheduled_jump.has_value()) {
+                program_counter = m_scheduled_jump.value();
+                m_scheduled_jump = {};
+            } else {
+                program_counter = instruction.resume_target().address();
+                // set the scheduled jump to the old value if we continue
+                // where we left it
+                m_scheduled_jump = old_scheduled_jump;
+            }
+            goto start;
+        }
 
+        handle_ScheduleJump: {
+            auto& instruction = *reinterpret_cast<Op::ScheduleJump const*>(&bytecode[program_counter]);
+            m_scheduled_jump = instruction.target().address();
+            auto finalizer = executable.exception_handlers_for_offset(program_counter).value().finalizer_offset;
+            VERIFY(finalizer.has_value());
+            program_counter = finalizer.value();
+            goto start;
+        }
+
+#define HANDLE_INSTRUCTION(name)                                                                                                          \
+    handle_##name:                                                                                                                        \
+    {                                                                                                                                     \
+        auto& instruction = *reinterpret_cast<Op::name const*>(&bytecode[program_counter]);                                               \
+        {                                                                                                                                 \
+            auto result = instruction.execute_impl(*this);                                                                                \
+            if (result.is_error()) {                                                                                                      \
+                if (handle_exception(program_counter, *result.throw_completion().value()) == HandleExceptionResponse::ExitFromExecutable) \
+                    return;                                                                                                               \
+                goto start;                                                                                                               \
+            }                                                                                                                             \
+        }                                                                                                                                 \
+        DISPATCH_NEXT(name);                                                                                                              \
+    }
+
+            HANDLE_INSTRUCTION(Add);
+            HANDLE_INSTRUCTION(ArrayAppend);
+            HANDLE_INSTRUCTION(AsyncIteratorClose);
+            HANDLE_INSTRUCTION(BitwiseAnd);
+            HANDLE_INSTRUCTION(BitwiseNot);
+            HANDLE_INSTRUCTION(BitwiseOr);
+            HANDLE_INSTRUCTION(BitwiseXor);
+            HANDLE_INSTRUCTION(BlockDeclarationInstantiation);
+            HANDLE_INSTRUCTION(Call);
+            HANDLE_INSTRUCTION(CallWithArgumentArray);
+            HANDLE_INSTRUCTION(Catch);
+            HANDLE_INSTRUCTION(ConcatString);
+            HANDLE_INSTRUCTION(CopyObjectExcludingProperties);
+            HANDLE_INSTRUCTION(CreateLexicalEnvironment);
+            HANDLE_INSTRUCTION(CreateVariable);
+            HANDLE_INSTRUCTION(Decrement);
+            HANDLE_INSTRUCTION(DeleteById);
+            HANDLE_INSTRUCTION(DeleteByIdWithThis);
+            HANDLE_INSTRUCTION(DeleteByValue);
+            HANDLE_INSTRUCTION(DeleteByValueWithThis);
+            HANDLE_INSTRUCTION(DeleteVariable);
+            HANDLE_INSTRUCTION(Div);
+            HANDLE_INSTRUCTION(Dump);
+            HANDLE_INSTRUCTION(EnterObjectEnvironment);
+            HANDLE_INSTRUCTION(Exp);
+            HANDLE_INSTRUCTION(GetById);
+            HANDLE_INSTRUCTION(GetByIdWithThis);
+            HANDLE_INSTRUCTION(GetByValue);
+            HANDLE_INSTRUCTION(GetByValueWithThis);
+            HANDLE_INSTRUCTION(GetCalleeAndThisFromEnvironment);
+            HANDLE_INSTRUCTION(GetGlobal);
+            HANDLE_INSTRUCTION(GetImportMeta);
+            HANDLE_INSTRUCTION(GetIterator);
+            HANDLE_INSTRUCTION(GetMethod);
+            HANDLE_INSTRUCTION(GetNewTarget);
+            HANDLE_INSTRUCTION(GetNextMethodFromIteratorRecord);
+            HANDLE_INSTRUCTION(GetObjectFromIteratorRecord);
+            HANDLE_INSTRUCTION(GetObjectPropertyIterator);
+            HANDLE_INSTRUCTION(GetPrivateById);
+            HANDLE_INSTRUCTION(GetVariable);
+            HANDLE_INSTRUCTION(GreaterThan);
+            HANDLE_INSTRUCTION(GreaterThanEquals);
+            HANDLE_INSTRUCTION(HasPrivateId);
+            HANDLE_INSTRUCTION(ImportCall);
+            HANDLE_INSTRUCTION(In);
+            HANDLE_INSTRUCTION(Increment);
+            HANDLE_INSTRUCTION(InstanceOf);
+            HANDLE_INSTRUCTION(IteratorClose);
+            HANDLE_INSTRUCTION(IteratorNext);
+            HANDLE_INSTRUCTION(IteratorToArray);
+            HANDLE_INSTRUCTION(LeaveFinally);
+            HANDLE_INSTRUCTION(LeaveLexicalEnvironment);
+            HANDLE_INSTRUCTION(LeaveUnwindContext);
+            HANDLE_INSTRUCTION(LeftShift);
+            HANDLE_INSTRUCTION(LessThan);
+            HANDLE_INSTRUCTION(LessThanEquals);
+            HANDLE_INSTRUCTION(LooselyEquals);
+            HANDLE_INSTRUCTION(LooselyInequals);
+            HANDLE_INSTRUCTION(Mod);
+            HANDLE_INSTRUCTION(Mul);
+            HANDLE_INSTRUCTION(NewArray);
+            HANDLE_INSTRUCTION(NewClass);
+            HANDLE_INSTRUCTION(NewFunction);
+            HANDLE_INSTRUCTION(NewObject);
+            HANDLE_INSTRUCTION(NewPrimitiveArray);
+            HANDLE_INSTRUCTION(NewRegExp);
+            HANDLE_INSTRUCTION(NewTypeError);
+            HANDLE_INSTRUCTION(Not);
+            HANDLE_INSTRUCTION(PostfixDecrement);
+            HANDLE_INSTRUCTION(PostfixIncrement);
+            HANDLE_INSTRUCTION(PutById);
+            HANDLE_INSTRUCTION(PutByIdWithThis);
+            HANDLE_INSTRUCTION(PutByValue);
+            HANDLE_INSTRUCTION(PutByValueWithThis);
+            HANDLE_INSTRUCTION(PutPrivateById);
+            HANDLE_INSTRUCTION(ResolveSuperBase);
+            HANDLE_INSTRUCTION(ResolveThisBinding);
+            HANDLE_INSTRUCTION(RestoreScheduledJump);
+            HANDLE_INSTRUCTION(RightShift);
+            HANDLE_INSTRUCTION(SetVariable);
+            HANDLE_INSTRUCTION(StrictlyEquals);
+            HANDLE_INSTRUCTION(StrictlyInequals);
+            HANDLE_INSTRUCTION(Sub);
+            HANDLE_INSTRUCTION(SuperCallWithArgumentArray);
+            HANDLE_INSTRUCTION(Throw);
+            HANDLE_INSTRUCTION(ThrowIfNotObject);
+            HANDLE_INSTRUCTION(ThrowIfNullish);
+            HANDLE_INSTRUCTION(ThrowIfTDZ);
+            HANDLE_INSTRUCTION(Typeof);
+            HANDLE_INSTRUCTION(TypeofVariable);
+            HANDLE_INSTRUCTION(UnaryMinus);
+            HANDLE_INSTRUCTION(UnaryPlus);
+            HANDLE_INSTRUCTION(UnsignedRightShift);
+
+        handle_Await: {
+            auto& instruction = *reinterpret_cast<Op::Await const*>(&bytecode[program_counter]);
+            auto result = instruction.execute(*this);
+
+            if (result.is_error()) {
+                if (handle_exception(program_counter, *result.throw_completion().value()) == HandleExceptionResponse::ExitFromExecutable)
+                    return;
+                goto start;
+            }
+            goto may_return;
+        }
+
+        handle_Return: {
+            auto& instruction = *reinterpret_cast<Op::Return const*>(&bytecode[program_counter]);
+            auto result = instruction.execute(*this);
+
+            if (result.is_error()) {
+                if (handle_exception(program_counter, *result.throw_completion().value()) == HandleExceptionResponse::ExitFromExecutable)
+                    return;
+                goto start;
+            }
+            goto may_return;
+        }
+
+        handle_Yield: {
+            auto& instruction = *reinterpret_cast<Op::Yield const*>(&bytecode[program_counter]);
+            auto result = instruction.execute(*this);
+
+            if (result.is_error()) {
+                if (handle_exception(program_counter, *result.throw_completion().value()) == HandleExceptionResponse::ExitFromExecutable)
+                    return;
+                goto start;
+            }
+            goto may_return;
+        }
+
+        may_return: {
+            auto& instruction = *reinterpret_cast<Instruction const*>(&bytecode[program_counter]);
             if (!reg(Register::return_value()).is_empty()) {
                 will_return = true;
                 // Note: A `yield` statement will not go through a finally statement,
@@ -424,51 +647,57 @@ void Interpreter::run_bytecode()
                 will_yield = (instruction.type() == Instruction::Type::Yield && static_cast<Op::Yield const&>(instruction).continuation().has_value()) || instruction.type() == Instruction::Type::Await;
                 break;
             }
-            ++pc;
+
+            program_counter += instruction.length();
+            goto start;
+        }
         }
 
-        if (auto const* finalizer = m_current_block->finalizer(); finalizer && !will_yield) {
-            auto& running_execution_context = vm().running_execution_context();
-            auto& unwind_context = running_execution_context.unwind_contexts.last();
-            VERIFY(unwind_context.executable == m_current_executable);
-            reg(Register::saved_return_value()) = reg(Register::return_value());
-            reg(Register::return_value()) = {};
-            m_current_block = finalizer;
-            // the unwind_context will be pop'ed when entering the finally block
-            continue;
+        if (!will_yield) {
+            if (auto handlers = executable.exception_handlers_for_offset(program_counter); handlers.has_value()) {
+                if (auto finalizer = handlers.value().finalizer_offset; finalizer.has_value()) {
+                    VERIFY(!running_execution_context.unwind_contexts.is_empty());
+                    auto& unwind_context = running_execution_context.unwind_contexts.last();
+                    VERIFY(unwind_context.executable == m_current_executable);
+                    reg(Register::saved_return_value()) = reg(Register::return_value());
+                    reg(Register::return_value()) = {};
+                    program_counter = finalizer.value();
+                    // the unwind_context will be pop'ed when entering the finally block
+                    continue;
+                }
+            }
         }
-
-        if (pc.at_end())
-            break;
 
         if (will_return)
             break;
     }
 }
 
-Interpreter::ResultAndReturnRegister Interpreter::run_executable(Executable& executable, BasicBlock const* entry_point)
+Interpreter::ResultAndReturnRegister Interpreter::run_executable(Executable& executable, Optional<size_t> entry_point, Value initial_accumulator_value)
 {
     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter will run unit {:p}", &executable);
 
     TemporaryChange restore_executable { m_current_executable, GCPtr { executable } };
-    TemporaryChange restore_saved_jump { m_scheduled_jump, static_cast<BasicBlock const*>(nullptr) };
+    TemporaryChange restore_saved_jump { m_scheduled_jump, Optional<size_t> {} };
     TemporaryChange restore_realm { m_realm, GCPtr { vm().current_realm() } };
     TemporaryChange restore_global_object { m_global_object, GCPtr { m_realm->global_object() } };
     TemporaryChange restore_global_declarative_environment { m_global_declarative_environment, GCPtr { m_realm->global_environment().declarative_record() } };
 
     VERIFY(!vm().execution_context_stack().is_empty());
 
-    TemporaryChange restore_current_block { m_current_block, entry_point ?: executable.basic_blocks.first() };
-
     auto& running_execution_context = vm().running_execution_context();
     if (running_execution_context.registers.size() < executable.number_of_registers)
         running_execution_context.registers.resize(executable.number_of_registers);
 
+    TemporaryChange restore_registers { m_registers, running_execution_context.registers.span() };
+    TemporaryChange restore_locals { m_locals, running_execution_context.locals.span() };
+
+    reg(Register::accumulator()) = initial_accumulator_value;
     reg(Register::return_value()) = {};
 
     running_execution_context.executable = &executable;
 
-    run_bytecode();
+    run_bytecode(entry_point.value_or(0));
 
     dbgln_if(JS_BYTECODE_DEBUG, "Bytecode::Interpreter did run unit {:p}", &executable);
 
@@ -508,7 +737,7 @@ void Interpreter::enter_unwind_context()
         m_current_executable,
         vm().running_execution_context().lexical_environment);
     running_execution_context.previously_scheduled_jumps.append(m_scheduled_jump);
-    m_scheduled_jump = nullptr;
+    m_scheduled_jump = {};
 }
 
 void Interpreter::leave_unwind_context()
@@ -866,8 +1095,7 @@ ThrowCompletionOr<void> NewArray::execute_impl(Bytecode::Interpreter& interprete
 {
     auto array = MUST(Array::create(interpreter.realm(), 0));
     for (size_t i = 0; i < m_element_count; i++) {
-        auto& value = interpreter.reg(Register(m_elements[0].index() + i));
-        array->indexed_properties().put(i, value, default_attributes);
+        array->indexed_properties().put(i, interpreter.get(m_elements[i]), default_attributes);
     }
     interpreter.set(dst(), array);
     return {};
@@ -1212,6 +1440,18 @@ ThrowCompletionOr<void> JumpIf::execute_impl(Bytecode::Interpreter&) const
     __builtin_unreachable();
 }
 
+ThrowCompletionOr<void> JumpTrue::execute_impl(Bytecode::Interpreter&) const
+{
+    // Handled in the interpreter loop.
+    __builtin_unreachable();
+}
+
+ThrowCompletionOr<void> JumpFalse::execute_impl(Bytecode::Interpreter&) const
+{
+    // Handled in the interpreter loop.
+    __builtin_unreachable();
+}
+
 ThrowCompletionOr<void> JumpUndefined::execute_impl(Bytecode::Interpreter&) const
 {
     // Handled in the interpreter loop.
@@ -1459,9 +1699,9 @@ ThrowCompletionOr<void> Yield::execute_impl(Bytecode::Interpreter& interpreter) 
     if (m_continuation_label.has_value())
         // FIXME: If we get a pointer, which is not accurately representable as a double
         //        will cause this to explode
-        object->define_direct_property("continuation", Value(static_cast<double>(reinterpret_cast<u64>(&m_continuation_label->block()))), JS::default_attributes);
+        object->define_direct_property("continuation", Value(m_continuation_label->address()), JS::default_attributes);
     else
-        object->define_direct_property("continuation", Value(0), JS::default_attributes);
+        object->define_direct_property("continuation", js_null(), JS::default_attributes);
 
     object->define_direct_property("isAwait", Value(false), JS::default_attributes);
     interpreter.do_return(object);
@@ -1476,7 +1716,7 @@ ThrowCompletionOr<void> Await::execute_impl(Bytecode::Interpreter& interpreter) 
     object->define_direct_property("result", yielded_value, JS::default_attributes);
     // FIXME: If we get a pointer, which is not accurately representable as a double
     //        will cause this to explode
-    object->define_direct_property("continuation", Value(static_cast<double>(reinterpret_cast<u64>(&m_continuation_label.block()))), JS::default_attributes);
+    object->define_direct_property("continuation", Value(m_continuation_label.address()), JS::default_attributes);
     object->define_direct_property("isAwait", Value(true), JS::default_attributes);
     interpreter.do_return(object);
     return {};
@@ -1642,7 +1882,7 @@ ByteString NewArray::to_byte_string_impl(Bytecode::Executable const& executable)
     StringBuilder builder;
     builder.appendff("NewArray {}", format_operand("dst"sv, dst(), executable));
     if (m_element_count != 0) {
-        builder.appendff(", [{}-{}]", format_operand("from"sv, m_elements[0], executable), format_operand("to"sv, m_elements[1], executable));
+        builder.appendff(", {}", format_operand_list("args"sv, { m_elements, m_element_count }, executable));
     }
     return builder.to_byte_string();
 }
@@ -1729,7 +1969,7 @@ ByteString GetGlobal::to_byte_string_impl(Bytecode::Executable const& executable
 
 ByteString DeleteVariable::to_byte_string_impl(Bytecode::Executable const& executable) const
 {
-    return ByteString::formatted("DeleteVariable {} ({})", m_identifier, executable.identifier_table->get(m_identifier));
+    return ByteString::formatted("DeleteVariable {}", executable.identifier_table->get(m_identifier));
 }
 
 ByteString CreateLexicalEnvironment::to_byte_string_impl(Bytecode::Executable const&) const
@@ -1740,7 +1980,7 @@ ByteString CreateLexicalEnvironment::to_byte_string_impl(Bytecode::Executable co
 ByteString CreateVariable::to_byte_string_impl(Bytecode::Executable const& executable) const
 {
     auto mode_string = m_mode == EnvironmentMode::Lexical ? "Lexical" : "Variable";
-    return ByteString::formatted("CreateVariable env:{} immutable:{} global:{} {} ({})", mode_string, m_is_immutable, m_is_global, m_identifier, executable.identifier_table->get(m_identifier));
+    return ByteString::formatted("CreateVariable env:{} immutable:{} global:{} {}", mode_string, m_is_immutable, m_is_global, executable.identifier_table->get(m_identifier));
 }
 
 ByteString EnterObjectEnvironment::to_byte_string_impl(Executable const& executable) const
@@ -1869,36 +2109,45 @@ ByteString DeleteByIdWithThis::to_byte_string_impl(Bytecode::Executable const& e
 
 ByteString Jump::to_byte_string_impl(Bytecode::Executable const&) const
 {
-    if (m_true_target.has_value())
-        return ByteString::formatted("Jump {}", *m_true_target);
-    return ByteString::formatted("Jump <empty>");
+    return ByteString::formatted("Jump {}", m_target);
 }
 
 ByteString JumpIf::to_byte_string_impl(Bytecode::Executable const& executable) const
 {
-    auto true_string = m_true_target.has_value() ? ByteString::formatted("{}", *m_true_target) : "<empty>";
-    auto false_string = m_false_target.has_value() ? ByteString::formatted("{}", *m_false_target) : "<empty>";
     return ByteString::formatted("JumpIf {}, \033[32mtrue\033[0m:{} \033[32mfalse\033[0m:{}",
         format_operand("condition"sv, m_condition, executable),
-        true_string, false_string);
+        m_true_target,
+        m_false_target);
+}
+
+ByteString JumpTrue::to_byte_string_impl(Bytecode::Executable const& executable) const
+{
+    return ByteString::formatted("JumpTrue {}, {}",
+        format_operand("condition"sv, m_condition, executable),
+        m_target);
+}
+
+ByteString JumpFalse::to_byte_string_impl(Bytecode::Executable const& executable) const
+{
+    return ByteString::formatted("JumpFalse {}, {}",
+        format_operand("condition"sv, m_condition, executable),
+        m_target);
 }
 
 ByteString JumpNullish::to_byte_string_impl(Bytecode::Executable const& executable) const
 {
-    auto true_string = m_true_target.has_value() ? ByteString::formatted("{}", *m_true_target) : "<empty>";
-    auto false_string = m_false_target.has_value() ? ByteString::formatted("{}", *m_false_target) : "<empty>";
     return ByteString::formatted("JumpNullish {}, null:{} nonnull:{}",
         format_operand("condition"sv, m_condition, executable),
-        true_string, false_string);
+        m_true_target,
+        m_false_target);
 }
 
 ByteString JumpUndefined::to_byte_string_impl(Bytecode::Executable const& executable) const
 {
-    auto true_string = m_true_target.has_value() ? ByteString::formatted("{}", *m_true_target) : "<empty>";
-    auto false_string = m_false_target.has_value() ? ByteString::formatted("{}", *m_false_target) : "<empty>";
     return ByteString::formatted("JumpUndefined {}, undefined:{} defined:{}",
         format_operand("condition"sv, m_condition, executable),
-        true_string, false_string);
+        m_true_target,
+        m_false_target);
 }
 
 static StringView call_type_to_string(CallType type)
@@ -1919,7 +2168,7 @@ ByteString Call::to_byte_string_impl(Bytecode::Executable const& executable) con
     auto type = call_type_to_string(m_type);
 
     StringBuilder builder;
-    builder.appendff("Call{} {}, {}, {}"sv,
+    builder.appendff("Call{} {}, {}, {}, "sv,
         type,
         format_operand("dst"sv, m_dst, executable),
         format_operand("callee"sv, m_callee, executable),
@@ -1986,7 +2235,7 @@ ByteString NewClass::to_byte_string_impl(Bytecode::Executable const& executable)
     if (!name.is_empty())
         builder.appendff(", {}", name);
     if (m_lhs_name.has_value())
-        builder.appendff(", lhs_name:{}"sv, m_lhs_name.value());
+        builder.appendff(", lhs_name:{}"sv, executable.get_identifier(m_lhs_name.value()));
     return builder.to_byte_string();
 }
 
@@ -2073,8 +2322,8 @@ ByteString ContinuePendingUnwind::to_byte_string_impl(Bytecode::Executable const
 ByteString Yield::to_byte_string_impl(Bytecode::Executable const& executable) const
 {
     if (m_continuation_label.has_value()) {
-        return ByteString::formatted("Yield continuation:@{}, {}",
-            m_continuation_label->block().name(),
+        return ByteString::formatted("Yield continuation:{}, {}",
+            m_continuation_label.value(),
             format_operand("value"sv, m_value, executable));
     }
     return ByteString::formatted("Yield return {}",
@@ -2083,9 +2332,9 @@ ByteString Yield::to_byte_string_impl(Bytecode::Executable const& executable) co
 
 ByteString Await::to_byte_string_impl(Bytecode::Executable const& executable) const
 {
-    return ByteString::formatted("Await {}, continuation:@{}",
+    return ByteString::formatted("Await {}, continuation:{}",
         format_operand("argument"sv, m_argument, executable),
-        m_continuation_label.block().name());
+        m_continuation_label);
 }
 
 ByteString GetByValue::to_byte_string_impl(Bytecode::Executable const& executable) const

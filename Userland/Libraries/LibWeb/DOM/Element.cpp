@@ -23,6 +23,7 @@
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
 #include <LibWeb/DOM/ShadowRoot.h>
@@ -45,6 +46,7 @@
 #include <LibWeb/HTML/HTMLOptGroupElement.h>
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/HTMLStyleElement.h>
 #include <LibWeb/HTML/HTMLTableElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
@@ -1206,8 +1208,7 @@ void Element::set_scroll_left(double x)
     // 1. Let x be the given value.
 
     // 2. Normalize non-finite values for x.
-    if (!isfinite(x))
-        x = 0.0;
+    x = HTML::normalize_non_finite_values(x);
 
     // 3. Let document be the element’s node document.
     auto& document = this->document();
@@ -1263,8 +1264,7 @@ void Element::set_scroll_top(double y)
     // 1. Let y be the given value.
 
     // 2. Normalize non-finite values for y.
-    if (!isfinite(y))
-        y = 0.0;
+    y = HTML::normalize_non_finite_values(y);
 
     // 3. Let document be the element’s node document.
     auto& document = this->document();
@@ -1418,16 +1418,36 @@ bool Element::is_actually_disabled() const
     return false;
 }
 
-// https://w3c.github.io/DOM-Parsing/#dom-element-outerhtml
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
 WebIDL::ExceptionOr<String> Element::outer_html() const
 {
     return serialize_fragment(DOMParsing::RequireWellFormed::Yes, FragmentSerializationMode::Outer);
 }
 
-// https://w3c.github.io/DOM-Parsing/#dom-element-outerhtml
-WebIDL::ExceptionOr<void> Element::set_outer_html(String const&)
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
+WebIDL::ExceptionOr<void> Element::set_outer_html(String const& value)
 {
-    dbgln("FIXME: Implement Element::set_outer_html()");
+    // 1. Let parent be this's parent.
+    auto* parent = this->parent();
+
+    // 2. If parent is null, return. There would be no way to obtain a reference to the nodes created even if the remaining steps were run.
+    if (!parent)
+        return {};
+
+    // 3. If parent is a Document, throw a "NoModificationAllowedError" DOMException.
+    if (parent->is_document())
+        return WebIDL::NoModificationAllowedError::create(realm(), "Cannot set outer HTML on document"_fly_string);
+
+    // 4. If parent is a DocumentFragment, set parent to the result of creating an element given this's node document, body, and the HTML namespace.
+    if (parent->is_document_fragment())
+        parent = TRY(create_element(document(), HTML::TagNames::body, Namespace::HTML));
+
+    // 5. Let fragment be the result of invoking the fragment parsing algorithm steps given parent and the given value.
+    auto fragment = TRY(DOMParsing::parse_fragment(value, verify_cast<Element>(*parent)));
+
+    // 6. Replace this with fragment within this's parent.
+    TRY(parent->replace_child(fragment, *this));
+
     return {};
 }
 
@@ -2122,27 +2142,110 @@ HashMap<FlyString, CSS::StyleProperty> const& Element::custom_properties(Optiona
 // https://drafts.csswg.org/cssom-view/#dom-element-scroll
 void Element::scroll(double x, double y)
 {
-    // AD-HOC:
-    if (auto* paintable_box = this->paintable_box())
-        paintable_box->scroll_by(x, y);
+    // 1. If invoked with one argument, follow these substeps:
+    //    NOTE: Not relevant here.
+    // 2. If invoked with two arguments, follow these substeps:
+    //     1. Let options be null converted to a ScrollToOptions dictionary. [WEBIDL]
+    //     2. Let x and y be the arguments, respectively.
+    //     3. Normalize non-finite values for x and y.
+    //     4. Let the left dictionary member of options have the value x.
+    //     5. Let the top dictionary member of options have the value y.
+    x = HTML::normalize_non_finite_values(x);
+    y = HTML::normalize_non_finite_values(y);
+
+    // 3. Let document be the element’s node document.
+    auto& document = this->document();
+
+    // 4. If document is not the active document, terminate these steps.
+    if (!document.is_active())
+        return;
+
+    // 5. Let window be the value of document’s defaultView attribute.
+    auto* window = document.default_view();
+
+    // 6. If window is null, terminate these steps.
+    if (!window)
+        return;
+
+    // 7. If the element is the root element and document is in quirks mode, terminate these steps.
+    if (document.document_element() == this && document.in_quirks_mode())
+        return;
+
+    // NOTE: Ensure that layout is up-to-date before looking at metrics.
+    document.update_layout();
+
+    // 8. If the element is the root element invoke scroll() on window with scrollX on window as first argument and y as second argument, and terminate these steps.
+    if (document.document_element() == this) {
+        window->scroll(window->scroll_x(), y);
+        return;
+    }
+
+    // 9. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, invoke scroll() on window
+    //    with options as the only argument, and terminate these steps.
+    if (document.body() == this && document.in_quirks_mode() && !is_potentially_scrollable()) {
+        window->scroll(x, y);
+        return;
+    }
+
+    // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element has no overflow, terminate these steps.
+    // FIXME: or the element has no overflow
+    if (!paintable_box())
+        return;
+
+    // 11. Scroll the element to x,y, with the scroll behavior being the value of the behavior dictionary member of options.
+    // FIXME: Implement this in terms of calling "scroll the element".
+    auto scroll_offset = paintable_box()->scroll_offset();
+    scroll_offset.set_x(CSSPixels::nearest_value_for(x));
+    scroll_offset.set_y(CSSPixels::nearest_value_for(y));
+    paintable_box()->set_scroll_offset(scroll_offset);
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-void Element::scroll(HTML::ScrollToOptions const&)
+void Element::scroll(HTML::ScrollToOptions options)
 {
-    dbgln("FIXME: Implement Element::scroll(ScrollToOptions)");
+    // 1. If invoked with one argument, follow these substeps:
+    //     1. Let options be the argument.
+    //     2. Normalize non-finite values for left and top dictionary members of options, if present.
+    //     3. Let x be the value of the left dictionary member of options, if present, or the element’s current scroll position on the x axis otherwise.
+    //     4. Let y be the value of the top dictionary member of options, if present, or the element’s current scroll position on the y axis otherwise.
+    // NOTE: remaining steps performed by Element::scroll(double x, double y)
+    auto x = options.left.has_value() ? HTML::normalize_non_finite_values(options.left.value()) : scroll_left();
+    auto y = options.top.has_value() ? HTML::normalize_non_finite_values(options.top.value()) : scroll_top();
+    scroll(x, y);
 }
 
-// https://drafts.csswg.org/cssom-view/#dom-window-scrollby
+// https://drafts.csswg.org/cssom-view/#dom-element-scrollby
 void Element::scroll_by(double x, double y)
 {
-    dbgln("FIXME: Implement Element::scroll_by({}, {})", x, y);
+    // 1. Let options be null converted to a ScrollToOptions dictionary. [WEBIDL]
+    HTML::ScrollToOptions options;
+
+    // 2. Let x and y be the arguments, respectively.
+    // 3. Normalize non-finite values for x and y.
+    // 4. Let the left dictionary member of options have the value x.
+    // 5. Let the top dictionary member of options have the value y.
+    // NOTE: Element::scroll_by(HTML::ScrollToOptions) performs the normalization and following steps.
+    options.left = x;
+    options.top = y;
+    scroll_by(options);
 }
 
-// https://drafts.csswg.org/cssom-view/#dom-window-scrollby
-void Element::scroll_by(HTML::ScrollToOptions const&)
+// https://drafts.csswg.org/cssom-view/#dom-element-scrollby
+void Element::scroll_by(HTML::ScrollToOptions options)
 {
-    dbgln("FIXME: Implement Element::scroll_by(ScrollToOptions)");
+    // 1. Let options be the argument.
+    // 2. Normalize non-finite values for left and top dictionary members of options, if present.
+    auto left = HTML::normalize_non_finite_values(options.left);
+    auto top = HTML::normalize_non_finite_values(options.top);
+
+    // 3. Add the value of scrollLeft to the left dictionary member.
+    options.left = scroll_left() + left;
+
+    // 4. Add the value of scrollTop to the top dictionary member.
+    options.top = scroll_top() + top;
+
+    // 5. Act as if the scroll() method was invoked with options as the only argument.
+    scroll(options);
 }
 
 bool Element::id_reference_exists(String const& id_reference) const
@@ -2179,9 +2282,65 @@ IntersectionObserver::IntersectionObserverRegistration& Element::get_intersectio
 // https://html.spec.whatwg.org/multipage/dom.html#the-directionality
 Element::Directionality Element::directionality() const
 {
-    // The directionality of an element (any element, not just an HTML element) is either 'ltr' or 'rtl',
-    // and is determined as per the first appropriate set of steps from the following list:
+    // The directionality of an element (any element, not just an HTML element) is either 'ltr' or 'rtl'.
+    // To compute the directionality given an element element, switch on element's dir attribute state:
+    auto maybe_dir = this->dir();
+    if (maybe_dir.has_value()) {
+        auto dir = maybe_dir.release_value();
+        switch (dir) {
+        // -> ltr
+        case Dir::Ltr:
+            // Return 'ltr'.
+            return Directionality::Ltr;
+        // -> rtl
+        case Dir::Rtl:
+            // Return 'rtl'.
+            return Directionality::Rtl;
+        // -> auto
+        case Dir::Auto:
+            // 1. Let result be the auto directionality of element.
+            auto result = auto_directionality();
 
+            // 2. If result is null, then return 'ltr'.
+            if (!result.has_value())
+                return Directionality::Ltr;
+
+            // 3. Return result.
+            return result.release_value();
+        }
+    }
+    // -> undefined
+    VERIFY(!maybe_dir.has_value());
+
+    // FIXME: If element is a bdi element:
+    // FIXME:     1. Let result be the auto directionality of element.
+    // FIXME:     2. If result is null, then return 'ltr'.
+    // FIXME:     3. Return result.
+
+    // If element is an input element whose type attribute is in the Telephone state:
+    if (is<HTML::HTMLInputElement>(this) && static_cast<HTML::HTMLInputElement const&>(*this).type_state() == HTML::HTMLInputElement::TypeAttributeState::Telephone) {
+        // Return 'ltr'.
+        return Directionality::Ltr;
+    }
+
+    // Otherwise:
+    // Return the parent directionality of element.
+    return parent_directionality();
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#auto-directionality-form-associated-elements
+bool Element::is_auto_directionality_form_associated_element() const
+{
+    // The auto-directionality form-associated elements are:
+    // input elements whose type attribute is in the Hidden, Text, Search, Telephone, URL, Email, Password, Submit Button, Reset Button, or Button state,
+    // and textarea elements.
+    return is<HTML::HTMLTextAreaElement>(this)
+        || (is<HTML::HTMLInputElement>(this) && first_is_one_of(static_cast<HTML::HTMLInputElement const&>(*this).type_state(), HTML::HTMLInputElement::TypeAttributeState::Hidden, HTML::HTMLInputElement::TypeAttributeState::Text, HTML::HTMLInputElement::TypeAttributeState::Search, HTML::HTMLInputElement::TypeAttributeState::Telephone, HTML::HTMLInputElement::TypeAttributeState::URL, HTML::HTMLInputElement::TypeAttributeState::Email, HTML::HTMLInputElement::TypeAttributeState::Password, HTML::HTMLInputElement::TypeAttributeState::SubmitButton, HTML::HTMLInputElement::TypeAttributeState::ResetButton, HTML::HTMLInputElement::TypeAttributeState::Button));
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#auto-directionality
+Optional<Element::Directionality> Element::auto_directionality() const
+{
     static auto bidirectional_class_L = Unicode::bidirectional_class_from_string("L"sv);
     static auto bidirectional_class_AL = Unicode::bidirectional_class_from_string("AL"sv);
     static auto bidirectional_class_R = Unicode::bidirectional_class_from_string("R"sv);
@@ -2190,46 +2349,37 @@ Element::Directionality Element::directionality() const
     if (!bidirectional_class_L.has_value())
         return Directionality::Ltr;
 
-    auto dir = this->dir();
+    // https://html.spec.whatwg.org/multipage/dom.html#text-node-directionality
+    auto text_node_directionality = [](Text const& text_node) -> Optional<Directionality> {
+        // 1. If text's data does not contain a code point whose bidirectional character type is L, AL, or R, then return null.
+        // 2. Let codePoint be the first code point in text's data whose bidirectional character type is L, AL, or R.
+        Optional<Unicode::BidirectionalClass> found_character_bidi_class;
+        for (auto code_point : Utf8View(text_node.data())) {
+            auto bidi_class = Unicode::bidirectional_class(code_point);
+            if (first_is_one_of(bidi_class, bidirectional_class_L, bidirectional_class_AL, bidirectional_class_R)) {
+                found_character_bidi_class = bidi_class;
+                break;
+            }
+        }
+        if (!found_character_bidi_class.has_value())
+            return {};
 
-    // -> If the element's dir attribute is in the ltr state
-    // -> If the element is a document element and the dir attribute is not in a defined state
-    //    (i.e. it is not present or has an invalid value)
-    // -> If the element is an input element whose type attribute is in the Telephone state, and the
-    //    dir attribute is not in a defined state (i.e. it is not present or has an invalid value)
-    if (dir == Dir::Ltr
-        || (is_document_element() && !dir.has_value())
-        || (is<HTML::HTMLInputElement>(this)
-            && static_cast<HTML::HTMLInputElement const&>(*this).type_state() == HTML::HTMLInputElement::TypeAttributeState::Telephone
-            && !dir.has_value())) {
-        // The directionality of the element is 'ltr'.
+        // 3. If codePoint is of bidirectional character type AL or R, then return 'rtl'.
+        if (first_is_one_of(*found_character_bidi_class, bidirectional_class_AL, bidirectional_class_R))
+            return Directionality::Rtl;
+
+        // 4. If codePoint is of bidirectional character type L, then return 'ltr'.
+        // NOTE: codePoint should always be of bidirectional character type L by this point, so we can just return 'ltr' here.
+        VERIFY(*found_character_bidi_class == bidirectional_class_L);
         return Directionality::Ltr;
-    }
+    };
 
-    // -> If the element's dir attribute is in the rtl state
-    if (dir == Dir::Rtl) {
-        // The directionality of the element is 'rtl'.
-        return Directionality::Rtl;
-    }
+    // 1. If element is an auto-directionality form-associated element:
+    if (is_auto_directionality_form_associated_element()) {
+        auto const& value = static_cast<HTML::HTMLInputElement const&>(*this).value();
 
-    // -> If the element is an input element whose type attribute is in the Text, Search, Telephone,
-    //    URL, or Email state, and the dir attribute is in the auto state
-    // -> If the element is a textarea element and the dir attribute is in the auto state
-    if ((is<HTML::HTMLInputElement>(this)
-            && first_is_one_of(static_cast<HTML::HTMLInputElement const&>(*this).type_state(),
-                HTML::HTMLInputElement::TypeAttributeState::Text, HTML::HTMLInputElement::TypeAttributeState::Search,
-                HTML::HTMLInputElement::TypeAttributeState::Telephone, HTML::HTMLInputElement::TypeAttributeState::URL,
-                HTML::HTMLInputElement::TypeAttributeState::Email)
-            && dir == Dir::Auto)
-        || (is<HTML::HTMLTextAreaElement>(this) && dir == Dir::Auto)) {
-
-        auto value = is<HTML::HTMLInputElement>(this)
-            ? static_cast<HTML::HTMLInputElement const&>(*this).value()
-            : static_cast<HTML::HTMLTextAreaElement const&>(*this).value();
-
-        // If the element's value contains a character of bidirectional character type AL or R, and
-        // there is no character of bidirectional character type L anywhere before it in the element's
-        // value, then the directionality of the element is 'rtl'. [BIDI]
+        // 1. If element's value contains a character of bidirectional character type AL or R,
+        //    and there is no character of bidirectional character type L anywhere before it in the element's value, then return 'rtl'.
         for (auto code_point : Utf8View(value)) {
             auto bidi_class = Unicode::bidirectional_class(code_point);
             if (bidi_class == bidirectional_class_L)
@@ -2238,87 +2388,114 @@ Element::Directionality Element::directionality() const
                 return Directionality::Rtl;
         }
 
-        // Otherwise, if the element's value is not the empty string, or if the element is a document element,
-        // the directionality of the element is 'ltr'.
-        if (!value.is_empty() || is_document_element()) {
+        // 2. If element's value is not the empty string, then return 'ltr'.
+        if (value.is_empty())
             return Directionality::Ltr;
-        }
-        // Otherwise, the directionality of the element is the same as the element's parent element's directionality.
-        else {
-            return parent_element()->directionality();
-        }
+
+        // 3. Return null.
+        return {};
     }
 
-    // -> If the element's dir attribute is in the auto state
-    // FIXME: -> If the element is a bdi element and the dir attribute is not in a defined state
-    //    (i.e. it is not present or has an invalid value)
-    if (dir == Dir::Auto) {
-        // Find the first character in tree order that matches the following criteria:
-        // - The character is from a Text node that is a descendant of the element whose directionality is being determined.
-        // - The character is of bidirectional character type L, AL, or R. [BIDI]
-        // - The character is not in a Text node that has an ancestor element that is a descendant of
-        //   the element whose directionality is being determined and that is either:
-        //   - FIXME: A bdi element.
-        //   - A script element.
-        //   - A style element.
-        //   - A textarea element.
-        //   - An element with a dir attribute in a defined state.
-        Optional<u32> found_character;
-        Optional<Unicode::BidirectionalClass> found_character_bidi_class;
-        for_each_in_subtree_of_type<Text>([&](Text const& text_node) {
-            // Discard not-allowed ancestors
-            for (auto* ancestor = text_node.parent(); ancestor && ancestor != this; ancestor = ancestor->parent()) {
-                if (is<HTML::HTMLScriptElement>(*ancestor) || is<HTML::HTMLStyleElement>(*ancestor) || is<HTML::HTMLTextAreaElement>(*ancestor))
-                    return IterationDecision::Continue;
-                if (ancestor->is_element()) {
-                    auto ancestor_element = static_cast<Element const*>(ancestor);
-                    if (ancestor_element->dir().has_value())
-                        return IterationDecision::Continue;
+    // 2. If element is a slot element whose root is a shadow root and element's assigned nodes are not empty:
+    if (is<HTML::HTMLSlotElement>(this)) {
+        auto const& slot = static_cast<HTML::HTMLSlotElement const&>(*this);
+        if (slot.root().is_shadow_root() && !slot.assigned_nodes().is_empty()) {
+            // 1 . For each node child of element's assigned nodes:
+            for (auto const& child : slot.assigned_nodes()) {
+                // 1. Let childDirection be null.
+                Optional<Directionality> child_direction;
+
+                // 2. If child is a Text node, then set childDirection to the text node directionality of child.
+                if (child->is_text())
+                    child_direction = text_node_directionality(static_cast<Text const&>(*child));
+
+                // 3. Otherwise:
+                else {
+                    // 1. Assert: child is an Element node.
+                    VERIFY(child->is_element());
+
+                    // 2. Set childDirection to the auto directionality of child.
+                    child_direction = static_cast<HTML::HTMLElement const&>(*this).auto_directionality();
                 }
+
+                // 4. If childDirection is not null, then return childDirection.
+                if (child_direction.has_value())
+                    return child_direction;
             }
 
-            // Look for matching characters
-            for (auto code_point : Utf8View(text_node.data())) {
-                auto bidi_class = Unicode::bidirectional_class(code_point);
-                if (first_is_one_of(bidi_class, bidirectional_class_L, bidirectional_class_AL, bidirectional_class_R)) {
-                    found_character = code_point;
-                    found_character_bidi_class = bidi_class;
-                    return IterationDecision::Break;
-                }
+            // 2. Return null.
+            return {};
+        }
+    }
+
+    // 3. For each node descendant of element's descendants, in tree order:
+    Optional<Directionality> result;
+    for_each_in_subtree([&](auto& descendant) {
+        // 1. If descendant, or any of its ancestor elements that are descendants of element, is one of
+        // - FIXME: a bdi element
+        // - a script element
+        // - a style element
+        // - a textarea element
+        // - an element whose dir attribute is not in the undefined state
+        // then continue.
+        if (is<HTML::HTMLScriptElement>(descendant)
+            || is<HTML::HTMLStyleElement>(descendant)
+            || is<HTML::HTMLTextAreaElement>(descendant)
+            || (is<Element>(descendant) && static_cast<Element const&>(descendant).dir().has_value())) {
+            return TraversalDecision::SkipChildrenAndContinue;
+        }
+
+        // 2. If descendant is a slot element whose root is a shadow root, then return the directionality of that shadow root's host.
+        if (is<HTML::HTMLSlotElement>(descendant)) {
+            auto const& root = static_cast<HTML::HTMLSlotElement const&>(descendant).root();
+            if (root.is_shadow_root()) {
+                auto const& host = static_cast<ShadowRoot const&>(root).host();
+                VERIFY(host);
+                result = host->directionality();
+                return TraversalDecision::Break;
             }
+        }
 
-            return IterationDecision::Continue;
-        });
+        // 3. If descendant is not a Text node, then continue.
+        if (!descendant.is_text())
+            return TraversalDecision::Continue;
 
-        // If such a character is found and it is of bidirectional character type AL or R,
-        // the directionality of the element is 'rtl'.
-        if (found_character.has_value()
-            && first_is_one_of(found_character_bidi_class.value(), bidirectional_class_AL, bidirectional_class_R)) {
-            return Directionality::Rtl;
-        }
-        // If such a character is found and it is of bidirectional character type L,
-        // the directionality of the element is 'ltr'.
-        if (found_character.has_value() && found_character_bidi_class.value() == bidirectional_class_L) {
-            return Directionality::Ltr;
-        }
-        // Otherwise, if the element is a document element, the directionality of the element is 'ltr'.
-        else if (is_document_element()) {
-            return Directionality::Ltr;
-        }
-        // Otherwise, the directionality of the element is the same as the element's parent element's directionality.
-        else {
-            return parent_element()->directionality();
-        }
+        // 4. Let result be the text node directionality of descendant.
+        result = text_node_directionality(static_cast<Text const&>(descendant));
+
+        // 5. If result is not null, then return result.
+        if (result.has_value())
+            return TraversalDecision::Break;
+
+        return TraversalDecision::Continue;
+    });
+
+    if (result.has_value())
+        return result;
+
+    // 4. Return null.
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#parent-directionality
+Element::Directionality Element::parent_directionality() const
+{
+    // 1. Let parentNode be element's parent node.
+    auto const* parent_node = this->parent_node();
+
+    // 2. If parentNode is a shadow root, then return the directionality of parentNode's host.
+    if (is<ShadowRoot>(parent_node)) {
+        auto const& host = static_cast<ShadowRoot const&>(*parent_node).host();
+        VERIFY(host);
+        return host->directionality();
     }
 
-    // If the element has a parent element and the dir attribute is not in a defined state
-    // (i.e. it is not present or has an invalid value)
-    if (parent_element() && !dir.has_value()) {
-        // The directionality of the element is the same as the element's parent element's directionality.
-        return parent_element()->directionality();
-    }
+    // 3. If parentNode is an element, then return the directionality of parentNode.
+    if (is<Element>(parent_node))
+        return static_cast<Element const&>(*parent_node).directionality();
 
-    VERIFY_NOT_REACHED();
+    // 4. Return 'ltr'.
+    return Directionality::Ltr;
 }
 
 // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext①

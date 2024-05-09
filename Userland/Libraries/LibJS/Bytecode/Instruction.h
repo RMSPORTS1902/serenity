@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Forward.h>
+#include <AK/Function.h>
 #include <AK/Span.h>
 #include <LibJS/Bytecode/Executable.h>
 #include <LibJS/Forward.h>
@@ -68,8 +69,10 @@
     O(IteratorNext)                    \
     O(IteratorToArray)                 \
     O(Jump)                            \
+    O(JumpFalse)                       \
     O(JumpIf)                          \
     O(JumpNullish)                     \
+    O(JumpTrue)                        \
     O(JumpUndefined)                   \
     O(LeaveFinally)                    \
     O(LeaveLexicalEnvironment)         \
@@ -125,6 +128,7 @@ namespace JS::Bytecode {
 class alignas(void*) Instruction {
 public:
     constexpr static bool IsTerminator = false;
+    static constexpr bool IsVariableLength = false;
 
     enum class Type {
 #define __BYTECODE_OP(op) \
@@ -134,26 +138,22 @@ public:
     };
 
     Type type() const { return m_type; }
-    size_t length() const { return m_length; }
+    size_t length() const;
     ByteString to_byte_string(Bytecode::Executable const&) const;
     ThrowCompletionOr<void> execute(Bytecode::Interpreter&) const;
+    void visit_labels(Function<void(Label&)> visitor);
     static void destroy(Instruction&);
 
-    // FIXME: Find a better way to organize this information
-    void set_source_record(SourceRecord rec) { m_source_record = rec; }
-    SourceRecord source_record() const { return m_source_record; }
-
 protected:
-    Instruction(Type type, size_t length)
+    explicit Instruction(Type type)
         : m_type(type)
-        , m_length(length)
     {
     }
 
+    void visit_labels_impl(Function<void(Label&)>) { }
+
 private:
-    SourceRecord m_source_record {};
     Type m_type {};
-    size_t m_length {};
 };
 
 class InstructionStreamIterator {

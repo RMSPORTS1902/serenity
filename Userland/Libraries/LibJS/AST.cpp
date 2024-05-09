@@ -333,7 +333,7 @@ ThrowCompletionOr<ECMAScriptFunctionObject*> ClassExpression::create_class_const
         }
     }
 
-    auto prototype = Object::create(realm, proto_parent);
+    auto prototype = Object::create_prototype(realm, proto_parent);
     VERIFY(prototype);
 
     vm.running_execution_context().lexical_environment = class_environment;
@@ -1438,6 +1438,16 @@ void SequenceExpression::dump(int indent) const
     ASTNode::dump(indent);
     for (auto& expression : m_expressions)
         expression->dump(indent + 1);
+}
+
+bool ScopeNode::has_non_local_lexical_declarations() const
+{
+    bool result = false;
+    MUST(for_each_lexically_declared_identifier([&](Identifier const& identifier) {
+        if (!identifier.is_local())
+            result = true;
+    }));
+    return result;
 }
 
 ThrowCompletionOr<void> ScopeNode::for_each_lexically_scoped_declaration(ThrowCompletionOrVoidCallback<Declaration const&>&& callback) const

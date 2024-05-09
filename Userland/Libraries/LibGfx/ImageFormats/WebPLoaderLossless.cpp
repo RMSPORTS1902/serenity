@@ -42,7 +42,7 @@ ErrorOr<VP8LHeader> decode_webp_chunk_VP8L_header(ReadonlyBytes vp8l_data)
     dbgln_if(WEBP_DEBUG, "width {}, height {}, is_alpha_used {}, version_number {}",
         width, height, is_alpha_used, version_number);
 
-    // "The version_number is a 3 bit code that must be set to 0. Any other value should be treated as an error. [AMENDED]"
+    // "The version_number is a 3 bit code that must be set to 0. Any other value should be treated as an error."
     if (version_number != 0)
         return Error::from_string_literal("WebPImageDecoderPlugin: VP8L chunk invalid version_number");
 
@@ -81,17 +81,17 @@ private:
 
 ErrorOr<CanonicalCode> CanonicalCode::from_bytes(ReadonlyBytes bytes)
 {
-    auto non_zero_symbols = 0;
-    auto last_non_zero = -1;
+    auto non_zero_symbol_count = 0;
+    auto last_non_zero_symbol = -1;
     for (size_t i = 0; i < bytes.size(); i++) {
         if (bytes[i] != 0) {
-            non_zero_symbols++;
-            last_non_zero = i;
+            non_zero_symbol_count++;
+            last_non_zero_symbol = i;
         }
     }
 
-    if (non_zero_symbols == 1)
-        return CanonicalCode(last_non_zero);
+    if (non_zero_symbol_count == 1)
+        return CanonicalCode(last_non_zero_symbol);
 
     return CanonicalCode(TRY(Compress::CanonicalCode::from_bytes(bytes)));
 }
@@ -157,10 +157,7 @@ static ErrorOr<CanonicalCode> decode_webp_chunk_VP8L_prefix_code(LittleEndianInp
     // (...but webp uses 5 different prefix codes, while deflate doesn't.)
     int num_code_lengths = 4 + TRY(bit_stream.read_bits(4));
     dbgln_if(WEBP_DEBUG, "  num_code_lengths {}", num_code_lengths);
-
-    // "If num_code_lengths is > 19, the bit_stream is invalid. [AMENDED3]"
-    if (num_code_lengths > 19)
-        return Error::from_string_literal("WebPImageDecoderPlugin: invalid num_code_lengths");
+    VERIFY(num_code_lengths <= 19);
 
     constexpr int kCodeLengthCodes = 19;
     int kCodeLengthCodeOrder[kCodeLengthCodes] = { 17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
@@ -168,30 +165,30 @@ static ErrorOr<CanonicalCode> decode_webp_chunk_VP8L_prefix_code(LittleEndianInp
     for (int i = 0; i < num_code_lengths; ++i)
         code_length_code_lengths[kCodeLengthCodeOrder[i]] = TRY(bit_stream.read_bits(3));
 
-    // The spec is at best misleading here, suggesting that max_symbol should be set to "num_code_lengths" if it's not explicitly stored.
-    // But num_code_lengths doesn't mean the num_code_lengths mentioned a few lines further up in the spec (and in scope here),
-    // but alphabet_size!
-    //
-    // Since the spec doesn't mention it, see libwebp vp8l_dec.c, ReadHuffmanCode()
-    // which passes alphabet_size to ReadHuffmanCodeLengths() as num_symbols,
-    // and ReadHuffmanCodeLengths() then sets max_symbol to that.)
-    unsigned max_symbol = alphabet_size;
-    if (TRY(bit_stream.read_bits(1))) {
+    // "Next, if `ReadBits(1) == 0`, the maximum number of different read symbols
+    //  (`max_symbol`) for each symbol type (A, R, G, B, and distance) is set to its
+    //  alphabet size:"
+    unsigned max_symbol;
+    if (TRY(bit_stream.read_bits(1)) == 0) {
+        max_symbol = alphabet_size;
+    }
+    // "Otherwise, it is defined as:"
+    else {
+        // "int length_nbits = 2 + 2 * ReadBits(3);"
         int length_nbits = 2 + 2 * TRY(bit_stream.read_bits(3));
+        // "int max_symbol = 2 + ReadBits(length_nbits);"
         max_symbol = 2 + TRY(bit_stream.read_bits(length_nbits));
         dbgln_if(WEBP_DEBUG, "  extended, length_nbits {} max_symbol {}", length_nbits, max_symbol);
+
+        // "If `max_symbol` is larger than the size of the alphabet for the symbol type, the bitstream is invalid."
         if (max_symbol > alphabet_size)
             return Error::from_string_literal("WebPImageDecoderPlugin: invalid max_symbol");
     }
 
-    auto const code_length_code = TRY(CanonicalCode::from_bytes({ code_length_code_lengths, sizeof(code_length_code_lengths) }));
-
-    // Next we extract the code lengths of the code that was used to encode the block.
-
-    u8 last_non_zero = 8; // "If code 16 is used before a non-zero value has been emitted, a value of 8 is repeated."
-
     // "A prefix table is then built from code_length_code_lengths and used to read up to max_symbol code lengths."
     dbgln_if(WEBP_DEBUG, "  reading {} symbols from at most {} codes", alphabet_size, max_symbol);
+    auto const code_length_code = TRY(CanonicalCode::from_bytes({ code_length_code_lengths, sizeof(code_length_code_lengths) }));
+    u8 last_non_zero = 8; // "If code 16 is used before a non-zero value has been emitted, a value of 8 is repeated."
     while (code_lengths.size() < alphabet_size) {
         if (max_symbol == 0)
             break;
@@ -241,8 +238,9 @@ static ErrorOr<PrefixCodeGroup> decode_webp_chunk_VP8L_prefix_code_group(u16 col
     //                  ; understand what each of these five prefix
     //                  ; codes are for.
 
-    // "Once code lengths are read, a prefix code for each symbol type (A, R, G, B, distance) is formed using their respective alphabet sizes:
-    //  * G channel: 256 + 24 + color_cache_size
+    // "Once code lengths are read, a prefix code for each symbol type (A, R, G, B, distance) is formed using their respective alphabet sizes."
+    // ...
+    // "* G channel: 256 + 24 + color_cache_size
     //  * other literals (A,R,B): 256
     //  * distance code: 40"
     Array<size_t, 5> const alphabet_sizes { 256 + 24 + static_cast<size_t>(color_cache_size), 256, 256, 256, 40 };
@@ -324,7 +322,7 @@ static ErrorOr<NonnullRefPtr<Bitmap>> decode_webp_chunk_VP8L_image(ImageKind ima
 
     // https://developers.google.com/speed/webp/docs/webp_lossless_bitstream_specification#52_encoding_of_image_data
     // "The encoded image data consists of several parts:
-    //    1. Decoding and building the prefix codes [AMENDED2]
+    //    1. Decoding and building the prefix codes
     //    2. Meta prefix codes
     //    3. Entropy-coded image data"
     // data                  =  prefix-codes lz77-coded-image
@@ -542,7 +540,7 @@ private:
         int pT = abs(pAlpha - (int)ALPHA(T)) + abs(pRed - (int)RED(T)) + abs(pGreen - (int)GREEN(T)) + abs(pBlue - (int)BLUE(T));
 
         // "Return either left or top, the one closer to the prediction."
-        if (pL < pT) { // "\[AMENDED\]"
+        if (pL < pT) {
             return L;
         } else {
             return T;
@@ -643,6 +641,8 @@ ErrorOr<NonnullRefPtr<Bitmap>> PredictorTransform::transform(NonnullRefPtr<Bitma
             u8 predictor = Color::from_argb(predictor_scanline[predictor_x]).green();
 
             ARGB32 predicted = TRY(predict(predictor, TL, T, TR, L));
+
+            // "The final pixel value is obtained by adding each channel of the predicted value to the encoded residual value."
             bitmap_scanline[x] = add_argb32(bitmap_scanline[x], predicted);
 
             TL = T;
@@ -839,7 +839,7 @@ public:
     // If the palette has 5 to 16 colors, every index needs 4 bits and every pixel can encode 2 output pixels.
     // This returns how many output pixels one input pixel can encode after the color indexing transform.
     //
-    // The spec isn't very explicit about this, but this affects all images after the color indexing transform:
+    // This affects all images after the color indexing transform:
     // If a webp file contains a 29x32 image and it contains a color indexing transform with a 4-color palette, then the in-memory size of all images
     // after the color indexing transform assume a bitmap size of ceil_div(29, 4)x32 = 8x32.
     // That is, the sizes of transforms after the color indexing transform are computed relative to the size 8x32,
@@ -871,13 +871,16 @@ ErrorOr<NonnullOwnPtr<ColorIndexingTransform>> ColorIndexingTransform::read(Litt
     auto palette_bitmap = TRY(decode_webp_chunk_VP8L_image(ImageKind::EntropyCoded, BitmapFormat::BGRA8888, palette_image_size, bit_stream));
 
     // "When the color table is small (equal to or less than 16 colors), several pixels are bundled into a single pixel..."
-    int pixels_per_pixel = 1;
+    int width_bits;
     if (color_table_size <= 2)
-        pixels_per_pixel = 8;
+        width_bits = 3;
     else if (color_table_size <= 4)
-        pixels_per_pixel = 4;
+        width_bits = 2;
     else if (color_table_size <= 16)
-        pixels_per_pixel = 2;
+        width_bits = 1;
+    else
+        width_bits = 0;
+    int pixels_per_pixel = 1 << width_bits;
 
     // "The color table is always subtraction-coded to reduce image entropy. [...]  In decoding, every final color in the color table
     //  can be obtained by adding the previous color component values by each ARGB component separately,
@@ -943,7 +946,6 @@ ErrorOr<NonnullRefPtr<Bitmap>> decode_webp_chunk_VP8L_contents(VP8LHeader const&
     auto stored_size = IntSize { vp8l_header.width, vp8l_header.height };
 
     // optional-transform   =  (%b1 transform optional-transform) / %b0
-    // "Each transform is allowed to be used only once."
     u8 seen_transforms = 0;
     Vector<NonnullOwnPtr<Transform>, 4> transforms;
     while (TRY(bit_stream.read_bits(1))) {
@@ -967,12 +969,13 @@ ErrorOr<NonnullRefPtr<Bitmap>> decode_webp_chunk_VP8L_contents(VP8LHeader const&
         TransformType transform_type = static_cast<TransformType>(TRY(bit_stream.read_bits(2)));
         dbgln_if(WEBP_DEBUG, "transform type {}", (int)transform_type);
 
-        // Check that each transform is used only once.
+        // "Each transform is allowed to be used only once."
         u8 mask = 1 << (int)transform_type;
         if (seen_transforms & mask)
             return Error::from_string_literal("WebPImageDecoderPlugin: transform type used multiple times");
         seen_transforms |= mask;
 
+        // "Transform data contains the information required to apply the inverse transform and depends on the transform type."
         switch (transform_type) {
         case PREDICTOR_TRANSFORM:
             TRY(transforms.try_append(TRY(PredictorTransform::read(bit_stream, stored_size))));
@@ -985,7 +988,10 @@ ErrorOr<NonnullRefPtr<Bitmap>> decode_webp_chunk_VP8L_contents(VP8LHeader const&
             break;
         case COLOR_INDEXING_TRANSFORM: {
             auto color_indexing_transform = TRY(ColorIndexingTransform::read(bit_stream, stored_size.width()));
+
+            // "After reading this transform, image_width is subsampled by width_bits. This affects the size of subsequent transforms."
             stored_size.set_width(ceil_div(stored_size.width(), color_indexing_transform->pixels_per_pixel()));
+
             TRY(transforms.try_append(move(color_indexing_transform)));
             break;
         }
@@ -995,8 +1001,7 @@ ErrorOr<NonnullRefPtr<Bitmap>> decode_webp_chunk_VP8L_contents(VP8LHeader const&
     auto format = vp8l_header.is_alpha_used ? BitmapFormat::BGRA8888 : BitmapFormat::BGRx8888;
     auto bitmap = TRY(decode_webp_chunk_VP8L_image(ImageKind::SpatiallyCoded, format, stored_size, bit_stream));
 
-    // Transforms have to be applied in the reverse order they appear in in the file.
-    // (As far as I can tell, this isn't mentioned in the spec.)
+    // "The inverse transforms are applied in the reverse order that they are read from the bitstream, that is, last one first."
     for (auto const& transform : transforms.in_reverse())
         bitmap = TRY(transform->transform(bitmap));
 

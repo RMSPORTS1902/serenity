@@ -135,6 +135,7 @@ void HTMLInputElement::set_checked(bool checked, ChangeSource change_source)
     if (parent()) {
         parent()->for_each_child([&](auto& child) {
             child.invalidate_style();
+            return IterationDecision::Continue;
         });
     }
 }
@@ -1397,7 +1398,7 @@ void HTMLInputElement::set_checked_within_group()
     document().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
         if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
             element.set_checked(false, ChangeSource::User);
-        return IterationDecision::Continue;
+        return TraversalDecision::Continue;
     });
 }
 
@@ -1424,9 +1425,9 @@ void HTMLInputElement::legacy_pre_activation_behavior()
         document().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
             if (element.checked() && is_in_same_radio_button_group(*this, element)) {
                 m_legacy_pre_activation_behavior_checked_element_in_group = &element;
-                return IterationDecision::Break;
+                return TraversalDecision::Break;
             }
-            return IterationDecision::Continue;
+            return TraversalDecision::Continue;
         });
 
         set_checked_within_group();

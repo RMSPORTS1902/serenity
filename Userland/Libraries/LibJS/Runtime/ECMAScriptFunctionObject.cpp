@@ -308,7 +308,7 @@ ECMAScriptFunctionObject::ECMAScriptFunctionObject(DeprecatedFlyString name, Byt
 
     // 30. If strict is false, then
     if (!m_strict) {
-        bool can_elide_declarative_environment = !m_contains_direct_call_to_eval && (!scope_body || !scope_body->has_lexical_declarations());
+        bool can_elide_declarative_environment = !m_contains_direct_call_to_eval && (!scope_body || !scope_body->has_non_local_lexical_declarations());
         if (can_elide_declarative_environment) {
             lex_environment_size = var_environment_size;
         } else {
@@ -350,17 +350,17 @@ void ECMAScriptFunctionObject::initialize(Realm& realm)
         Object* prototype = nullptr;
         switch (m_kind) {
         case FunctionKind::Normal:
-            prototype = vm.heap().allocate<Object>(realm, realm.intrinsics().new_ordinary_function_prototype_object_shape());
+            prototype = Object::create_prototype(realm, realm.intrinsics().object_prototype());
             MUST(prototype->define_property_or_throw(vm.names.constructor, { .value = this, .writable = true, .enumerable = false, .configurable = true }));
             break;
         case FunctionKind::Generator:
             // prototype is "g1.prototype" in figure-2 (https://tc39.es/ecma262/img/figure-2.png)
-            prototype = Object::create(realm, realm.intrinsics().generator_function_prototype_prototype());
+            prototype = Object::create_prototype(realm, realm.intrinsics().generator_function_prototype_prototype());
             break;
         case FunctionKind::Async:
             break;
         case FunctionKind::AsyncGenerator:
-            prototype = Object::create(realm, realm.intrinsics().async_generator_function_prototype_prototype());
+            prototype = Object::create_prototype(realm, realm.intrinsics().async_generator_function_prototype_prototype());
             break;
         }
         // 27.7.4 AsyncFunction Instances, https://tc39.es/ecma262/#sec-async-function-instances
@@ -384,7 +384,7 @@ ThrowCompletionOr<Value> ECMAScriptFunctionObject::internal_call(Value this_argu
 
     // Non-standard
     callee_context->arguments.append(arguments_list.data(), arguments_list.size());
-    callee_context->instruction_stream_iterator = vm.bytecode_interpreter().instruction_stream_iterator();
+    callee_context->program_counter = vm.bytecode_interpreter().program_counter();
 
     // 2. Let calleeContext be PrepareForOrdinaryCall(F, undefined).
     // NOTE: We throw if the end of the native stack is reached, so unlike in the spec this _does_ need an exception check.
@@ -455,7 +455,7 @@ ThrowCompletionOr<NonnullGCPtr<Object>> ECMAScriptFunctionObject::internal_const
 
     // Non-standard
     callee_context->arguments.append(arguments_list.data(), arguments_list.size());
-    callee_context->instruction_stream_iterator = vm.bytecode_interpreter().instruction_stream_iterator();
+    callee_context->program_counter = vm.bytecode_interpreter().program_counter();
 
     // 4. Let calleeContext be PrepareForOrdinaryCall(F, newTarget).
     // NOTE: We throw if the end of the native stack is reached, so unlike in the spec this _does_ need an exception check.
@@ -726,7 +726,7 @@ ThrowCompletionOr<void> ECMAScriptFunctionObject::function_declaration_instantia
                     for (size_t register_index = 0; register_index < saved_registers.size(); ++register_index)
                         saved_registers[register_index] = {};
 
-                    auto result_and_return_register = vm.bytecode_interpreter().run_executable(*m_default_parameter_bytecode_executables[default_parameter_index - 1], nullptr);
+                    auto result_and_return_register = vm.bytecode_interpreter().run_executable(*m_default_parameter_bytecode_executables[default_parameter_index - 1], {});
 
                     for (size_t register_index = 0; register_index < saved_registers.size(); ++register_index)
                         running_execution_context.registers[register_index] = saved_registers[register_index];
@@ -870,7 +870,7 @@ ThrowCompletionOr<void> ECMAScriptFunctionObject::function_declaration_instantia
         // Optimization: We avoid creating empty top-level declarative environments in non-strict mode, if both of these conditions are true:
         //               1. there is no direct call to eval() within this function
         //               2. there are no lexical declarations that would go into the environment
-        bool can_elide_declarative_environment = !m_contains_direct_call_to_eval && (!scope_body || !scope_body->has_lexical_declarations());
+        bool can_elide_declarative_environment = !m_contains_direct_call_to_eval && (!scope_body || !scope_body->has_non_local_lexical_declarations());
         if (can_elide_declarative_environment) {
             lex_environment = var_environment;
         } else {
@@ -1124,7 +1124,7 @@ void async_block_start(VM& vm, T const& async_body, PromiseCapability const& pro
             if (maybe_executable.is_error())
                 result = maybe_executable.release_error();
             else
-                result = vm.bytecode_interpreter().run_executable(*maybe_executable.value(), nullptr).value;
+                result = vm.bytecode_interpreter().run_executable(*maybe_executable.value(), {}).value;
         }
         // b. Else,
         else {
@@ -1251,7 +1251,7 @@ Completion ECMAScriptFunctionObject::ordinary_call_evaluate_body()
         }
     }
 
-    auto result_and_frame = vm.bytecode_interpreter().run_executable(*m_bytecode_executable, nullptr);
+    auto result_and_frame = vm.bytecode_interpreter().run_executable(*m_bytecode_executable, {});
 
     if (result_and_frame.value.is_error())
         return result_and_frame.value.release_error();

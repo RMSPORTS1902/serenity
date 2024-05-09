@@ -335,9 +335,9 @@ public:
     void set_custom_element_state(CustomElementState value) { m_custom_element_state = value; }
     void setup_custom_element_from_constructor(HTML::CustomElementDefinition& custom_element_definition, Optional<String> const& is_value);
 
-    void scroll(HTML::ScrollToOptions const&);
+    void scroll(HTML::ScrollToOptions);
     void scroll(double x, double y);
-    void scroll_by(HTML::ScrollToOptions const&);
+    void scroll_by(HTML::ScrollToOptions);
     void scroll_by(double x, double y);
 
     void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, IntersectionObserver::IntersectionObserverRegistration);
@@ -399,6 +399,10 @@ private:
     WebIDL::ExceptionOr<JS::GCPtr<Node>> insert_adjacent(StringView where, JS::NonnullGCPtr<Node> node);
 
     void enqueue_an_element_on_the_appropriate_element_queue();
+
+    Optional<Directionality> auto_directionality() const;
+    Directionality parent_directionality() const;
+    bool is_auto_directionality_form_associated_element() const;
 
     QualifiedName m_qualified_name;
     FlyString m_html_uppercased_qualified_name;

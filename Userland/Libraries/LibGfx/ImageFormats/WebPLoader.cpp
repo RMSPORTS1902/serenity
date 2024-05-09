@@ -445,6 +445,11 @@ static ErrorOr<void> decode_webp_extended(WebPLoadingContext& context, ReadonlyB
         return Error::from_string_literal("WebPImageDecoderPlugin: ICCP chunk is after image data");
     }
 
+    if (context.iccp_chunk.has_value() && !context.vp8x_header.has_icc)
+        return Error::from_string_literal("WebPImageDecoderPlugin: ICCP chunk present, but VP8X header claims no ICC profile");
+    if (!context.iccp_chunk.has_value() && context.vp8x_header.has_icc)
+        return Error::from_string_literal("WebPImageDecoderPlugin: VP8X header claims ICC profile, but no ICCP chunk present");
+
     context.state = WebPLoadingContext::State::ChunksDecoded;
     return {};
 }
@@ -543,11 +548,15 @@ static ErrorOr<ImageData> decode_webp_animation_frame_image_data(ANMFChunk const
     return decode_webp_set_image_data(move(alpha), move(image_data));
 }
 
-static ErrorOr<NonnullRefPtr<Bitmap>> decode_webp_image_data(ImageData const& image_data)
+static ErrorOr<NonnullRefPtr<Bitmap>> decode_webp_image_data(WebPLoadingContext& context, ImageData const& image_data)
 {
     if (image_data.image_data_chunk.id() == "VP8L"sv) {
         VERIFY(!image_data.alpha_chunk.has_value());
         auto vp8l_header = TRY(decode_webp_chunk_VP8L_header(image_data.image_data_chunk.data()));
+
+        if (context.first_chunk->id() == "VP8X" && context.vp8x_header.has_alpha != vp8l_header.is_alpha_used)
+            return Error::from_string_literal("WebPImageDecoderPlugin: VP8X header alpha flag doesn't match VP8L header");
+
         return decode_webp_chunk_VP8L_contents(vp8l_header);
     }
 
@@ -597,7 +606,7 @@ static ErrorOr<ImageFrameDescriptor> decode_webp_animation_frame(WebPLoadingCont
         }
 
         auto frame_image_data = TRY(decode_webp_animation_frame_image_data(frame_description));
-        auto frame_bitmap = TRY(decode_webp_image_data(frame_image_data));
+        auto frame_bitmap = TRY(decode_webp_image_data(context, frame_image_data));
         if (static_cast<u32>(frame_bitmap->width()) != frame_description.frame_width || static_cast<u32>(frame_bitmap->height()) != frame_description.frame_height)
             return Error::from_string_literal("WebPImageDecoderPlugin: decoded frame bitmap size doesn't match frame description size");
 
@@ -709,7 +718,7 @@ ErrorOr<ImageFrameDescriptor> WebPImageDecoderPlugin::frame(size_t index, Option
         }
 
         if (m_context->state < WebPLoadingContext::State::BitmapDecoded) {
-            auto bitmap = TRY(decode_webp_image_data(m_context->image_data.value()));
+            auto bitmap = TRY(decode_webp_image_data(*m_context, m_context->image_data.value()));
 
             // Check that size in VP8X chunk matches dimensions in VP8 or VP8L chunk if both are present.
             if (m_context->first_chunk->id() == "VP8X") {

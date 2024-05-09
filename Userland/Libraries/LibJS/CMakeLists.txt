@@ -9,7 +9,9 @@ set(SOURCES
     Bytecode/IdentifierTable.cpp
     Bytecode/Instruction.cpp
     Bytecode/Interpreter.cpp
+    Bytecode/Label.cpp
     Bytecode/RegexTable.cpp
+    Bytecode/ScopedOperand.cpp
     Bytecode/StringTable.cpp
     Console.cpp
     Contrib/Test262/262Object.cpp

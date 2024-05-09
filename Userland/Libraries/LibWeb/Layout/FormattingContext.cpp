@@ -243,6 +243,7 @@ CSSPixels FormattingContext::greatest_child_width(Box const& box) const
         box.for_each_child_of_type<Box>([&](Box const& child) {
             if (!child.is_absolutely_positioned())
                 max_width = max(max_width, m_state.get(child).margin_box_width());
+            return IterationDecision::Continue;
         });
     }
     return max_width;
@@ -409,9 +410,9 @@ CSSPixels FormattingContext::compute_table_box_width_inside_table_wrapper(Box co
     box.for_each_in_subtree_of_type<Box>([&](Box const& child_box) {
         if (child_box.display().is_table_inside()) {
             table_box = child_box;
-            return IterationDecision::Break;
+            return TraversalDecision::Break;
         }
-        return IterationDecision::Continue;
+        return TraversalDecision::Continue;
     });
     VERIFY(table_box.has_value());
 
@@ -463,9 +464,9 @@ CSSPixels FormattingContext::compute_table_box_height_inside_table_wrapper(Box c
     box.for_each_in_subtree_of_type<Box>([&](Box const& child_box) {
         if (child_box.display().is_table_inside()) {
             table_box = child_box;
-            return IterationDecision::Break;
+            return TraversalDecision::Break;
         }
-        return IterationDecision::Continue;
+        return TraversalDecision::Continue;
     });
     VERIFY(table_box.has_value());
 
@@ -1807,9 +1808,9 @@ bool FormattingContext::can_skip_is_anonymous_text_run(Box& box)
         box.for_each_in_subtree([&](auto const& node) {
             if (!is<TextNode>(node) || !static_cast<TextNode const&>(node).dom_node().data().bytes_as_string_view().is_whitespace()) {
                 contains_only_white_space = false;
-                return IterationDecision::Break;
+                return TraversalDecision::Break;
             }
-            return IterationDecision::Continue;
+            return TraversalDecision::Continue;
         });
         if (contains_only_white_space)
             return true;

@@ -35,6 +35,9 @@ public:
     double current_time() const { return m_current_time; }
     Bindings::AudioContextState state() const { return m_control_thread_state; }
 
+    // https://webaudio.github.io/web-audio-api/#--nyquist-frequency
+    float nyquist_frequency() const { return m_sample_rate / 2; }
+
     void set_onstatechange(WebIDL::CallbackType*);
     WebIDL::CallbackType* onstatechange();
 
@@ -47,7 +50,7 @@ public:
     WebIDL::ExceptionOr<JS::NonnullGCPtr<OscillatorNode>> create_oscillator();
 
 protected:
-    explicit BaseAudioContext(JS::Realm&);
+    explicit BaseAudioContext(JS::Realm&, float m_sample_rate = 0);
 
     virtual void initialize(JS::Realm&) override;
 

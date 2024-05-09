@@ -46,6 +46,28 @@ static QIcon const& app_icon()
     return icon;
 }
 
+class HamburgerMenu : public QMenu {
+public:
+    using QMenu::QMenu;
+    virtual ~HamburgerMenu() override = default;
+
+    virtual void showEvent(QShowEvent*) override
+    {
+        if (!isVisible())
+            return;
+        auto* browser_window = verify_cast<BrowserWindow>(parentWidget());
+        if (!browser_window)
+            return;
+        auto* current_tab = browser_window->current_tab();
+        if (!current_tab)
+            return;
+        // Ensure the hamburger menu placed within the browser window.
+        auto* hamburger_button = current_tab->hamburger_button();
+        auto button_top_right = hamburger_button->mapToGlobal(hamburger_button->rect().bottomRight());
+        move(button_top_right - QPoint(rect().width(), 0));
+    }
+};
+
 BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, WebView::CookieJar& cookie_jar, WebContentOptions const& web_content_options, StringView webdriver_content_ipc_path)
     : m_tabs_container(new TabWidget(this))
     , m_cookie_jar(cookie_jar)
@@ -72,38 +94,43 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, WebView::Cook
         });
     }
 
-    auto* menu = menuBar()->addMenu("&File");
+    m_hamburger_menu = new HamburgerMenu(this);
 
-    auto* about_action = new QAction("&About Ladybird", this);
-    menu->addAction(about_action);
+    if (!Settings::the()->show_menubar())
+        menuBar()->hide();
 
-    menu->addSeparator();
+    QObject::connect(Settings::the(), &Settings::show_menubar_changed, this, [this](bool show_menubar) {
+        menuBar()->setVisible(show_menubar);
+    });
+
+    auto* file_menu = menuBar()->addMenu("&File");
 
     m_new_tab_action = new QAction("New &Tab", this);
     m_new_tab_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::AddTab));
-    menu->addAction(m_new_tab_action);
+    m_hamburger_menu->addAction(m_new_tab_action);
+    file_menu->addAction(m_new_tab_action);
 
     m_new_window_action = new QAction("New &Window", this);
     m_new_window_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::New));
-    menu->addAction(m_new_window_action);
+    m_hamburger_menu->addAction(m_new_window_action);
+    file_menu->addAction(m_new_window_action);
 
     auto* close_current_tab_action = new QAction("&Close Current Tab", this);
     close_current_tab_action->setIcon(load_icon_from_uri("resource://icons/16x16/close-tab.png"sv));
     close_current_tab_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Close));
-    menu->addAction(close_current_tab_action);
+    m_hamburger_menu->addAction(close_current_tab_action);
+    file_menu->addAction(close_current_tab_action);
 
     auto* open_file_action = new QAction("&Open File...", this);
     open_file_action->setIcon(load_icon_from_uri("resource://icons/16x16/filetype-folder-open.png"sv));
     open_file_action->setShortcut(QKeySequence(QKeySequence::StandardKey::Open));
-    menu->addAction(open_file_action);
+    m_hamburger_menu->addAction(open_file_action);
+    file_menu->addAction(open_file_action);
 
-    menu->addSeparator();
+    m_hamburger_menu->addSeparator();
 
-    auto* quit_action = new QAction("&Quit", this);
-    quit_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Quit));
-    menu->addAction(quit_action);
-
-    auto* edit_menu = menuBar()->addMenu("&Edit");
+    auto* edit_menu = m_hamburger_menu->addMenu("&Edit");
+    menuBar()->addMenu(edit_menu);
 
     m_copy_selection_action = new QAction("&Copy", this);
     m_copy_selection_action->setIcon(load_icon_from_uri("resource://icons/16x16/edit-copy.png"sv));
@@ -130,7 +157,8 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, WebView::Cook
     settings_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Preferences));
     edit_menu->addAction(settings_action);
 
-    auto* view_menu = menuBar()->addMenu("&View");
+    auto* view_menu = m_hamburger_menu->addMenu("&View");
+    menuBar()->addMenu(view_menu);
 
     auto* open_next_tab_action = new QAction("Open &Next Tab", this);
     open_next_tab_action->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_PageDown));
@@ -192,7 +220,16 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, WebView::Cook
 
     auto_color_scheme->setChecked(true);
 
-    auto* inspect_menu = menuBar()->addMenu("&Inspect");
+    auto* show_menubar = new QAction("Show &Menubar", this);
+    show_menubar->setCheckable(true);
+    show_menubar->setChecked(Settings::the()->show_menubar());
+    view_menu->addAction(show_menubar);
+    QObject::connect(show_menubar, &QAction::triggered, this, [](bool checked) {
+        Settings::the()->set_show_menubar(checked);
+    });
+
+    auto* inspect_menu = m_hamburger_menu->addMenu("&Inspect");
+    menuBar()->addMenu(inspect_menu);
 
     m_view_source_action = new QAction("View &Source", this);
     m_view_source_action->setIcon(load_icon_from_uri("resource://icons/16x16/filetype-html.png"sv));
@@ -222,7 +259,8 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, WebView::Cook
         static_cast<Ladybird::Application*>(QApplication::instance())->show_task_manager_window();
     });
 
-    auto* debug_menu = menuBar()->addMenu("&Debug");
+    auto* debug_menu = m_hamburger_menu->addMenu("&Debug");
+    menuBar()->addMenu(debug_menu);
 
     auto* dump_session_history_tree_action = new QAction("Dump Session History Tree", this);
     dump_session_history_tree_action->setIcon(load_icon_from_uri("resource://icons/16x16/history.png"sv));
@@ -390,9 +428,24 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, WebView::Cook
         debug_request("same-origin-policy", state ? "on" : "off");
     });
 
+    auto* help_menu = m_hamburger_menu->addMenu("&Help");
+    menuBar()->addMenu(help_menu);
+
+    auto* about_action = new QAction("&About Ladybird", this);
+    help_menu->addAction(about_action);
     QObject::connect(about_action, &QAction::triggered, this, [this] {
         new_tab_from_url("about:version"sv, Web::HTML::ActivateTab::Yes);
     });
+
+    m_hamburger_menu->addSeparator();
+    file_menu->addSeparator();
+
+    auto* quit_action = new QAction("&Quit", this);
+    quit_action->setShortcuts(QKeySequence::keyBindings(QKeySequence::StandardKey::Quit));
+    m_hamburger_menu->addAction(quit_action);
+    file_menu->addAction(quit_action);
+    QObject::connect(quit_action, &QAction::triggered, this, &QMainWindow::close);
+
     QObject::connect(m_new_tab_action, &QAction::triggered, this, [this] {
         new_tab_from_url(ak_url_from_qstring(Settings::the()->new_tab_page()), Web::HTML::ActivateTab::Yes);
     });
@@ -409,7 +462,6 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, WebView::Cook
         m_settings_dialog->show();
         m_settings_dialog->setFocus();
     });
-    QObject::connect(quit_action, &QAction::triggered, this, &QMainWindow::close);
     QObject::connect(m_tabs_container, &QTabWidget::currentChanged, [this](int index) {
         auto* tab = verify_cast<Tab>(m_tabs_container->widget(index));
         if (tab)

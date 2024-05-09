@@ -254,9 +254,9 @@ static bool is_ignorable_whitespace(Layout::Node const& node)
         node.for_each_in_inclusive_subtree_of_type<TextNode>([&contains_only_white_space](auto& text_node) {
             if (!text_node.text_for_rendering().bytes_as_string_view().is_whitespace()) {
                 contains_only_white_space = false;
-                return IterationDecision::Break;
+                return TraversalDecision::Break;
             }
-            return IterationDecision::Continue;
+            return TraversalDecision::Continue;
         });
         if (contains_only_white_space)
             return true;
@@ -316,7 +316,7 @@ void TreeBuilder::create_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
                 node.set_paintable(nullptr);
                 if (is<DOM::Element>(node))
                     static_cast<DOM::Element&>(node).clear_pseudo_element_nodes({});
-                return IterationDecision::Continue;
+                return TraversalDecision::Continue;
             });
         }
     };
@@ -340,7 +340,18 @@ void TreeBuilder::create_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
         display = style->display();
         if (display.is_none())
             return;
-        layout_node = element.create_layout_node(*style);
+        if (context.layout_svg_mask_or_clip_path) {
+            if (is<SVG::SVGMaskElement>(dom_node))
+                layout_node = document.heap().allocate_without_realm<Layout::SVGMaskBox>(document, static_cast<SVG::SVGMaskElement&>(dom_node), *style);
+            else if (is<SVG::SVGClipPathElement>(dom_node))
+                layout_node = document.heap().allocate_without_realm<Layout::SVGClipBox>(document, static_cast<SVG::SVGClipPathElement&>(dom_node), *style);
+            else
+                VERIFY_NOT_REACHED();
+            // Only layout direct uses of SVG masks/clipPaths.
+            context.layout_svg_mask_or_clip_path = false;
+        } else {
+            layout_node = element.create_layout_node(*style);
+        }
     } else if (is<DOM::Document>(dom_node)) {
         style = style_computer.create_document_style();
         display = style->display();
@@ -348,17 +359,6 @@ void TreeBuilder::create_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
     } else if (is<DOM::Text>(dom_node)) {
         layout_node = document.heap().allocate_without_realm<Layout::TextNode>(document, static_cast<DOM::Text&>(dom_node));
         display = CSS::Display(CSS::DisplayOutside::Inline, CSS::DisplayInside::Flow);
-    }
-
-    if (context.layout_svg_mask_or_clip_path) {
-        if (is<SVG::SVGMaskElement>(dom_node))
-            layout_node = document.heap().allocate_without_realm<Layout::SVGMaskBox>(document, static_cast<SVG::SVGMaskElement&>(dom_node), *style);
-        else if (is<SVG::SVGClipPathElement>(dom_node))
-            layout_node = document.heap().allocate_without_realm<Layout::SVGClipBox>(document, static_cast<SVG::SVGClipPathElement&>(dom_node), *style);
-        else
-            VERIFY_NOT_REACHED();
-        // Only layout direct uses of SVG masks/clipPaths.
-        context.layout_svg_mask_or_clip_path = false;
     }
 
     if (!layout_node)
@@ -520,7 +520,7 @@ void TreeBuilder::for_each_in_tree_with_internal_display(NodeWithStyle& root, Ca
         auto const display = box.display();
         if (display.is_internal() && display.internal() == internal)
             callback(box);
-        return IterationDecision::Continue;
+        return TraversalDecision::Continue;
     });
 }
 
@@ -531,7 +531,7 @@ void TreeBuilder::for_each_in_tree_with_inside_display(NodeWithStyle& root, Call
         auto const display = box.display();
         if (display.is_outside_and_inside() && display.inside() == inside)
             callback(box);
-        return IterationDecision::Continue;
+        return TraversalDecision::Continue;
     });
 }
 
@@ -553,6 +553,7 @@ void TreeBuilder::remove_irrelevant_boxes(NodeWithStyle& root)
     for_each_in_tree_with_internal_display<CSS::DisplayInternal::TableColumn>(root, [&](Box& table_column) {
         table_column.for_each_child([&](auto& child) {
             to_remove.append(child);
+            return IterationDecision::Continue;
         });
     });
 
@@ -561,6 +562,7 @@ void TreeBuilder::remove_irrelevant_boxes(NodeWithStyle& root)
         table_column_group.for_each_child([&](auto& child) {
             if (!child.display().is_table_column())
                 to_remove.append(child);
+            return IterationDecision::Continue;
         });
     });
 
@@ -740,7 +742,7 @@ Vector<JS::Handle<Box>> TreeBuilder::generate_missing_parents(NodeWithStyle& roo
             table_roots_to_wrap.append(parent);
         }
 
-        return IterationDecision::Continue;
+        return TraversalDecision::Continue;
     });
 
     for (auto& table_box : table_roots_to_wrap) {
@@ -770,6 +772,7 @@ static void for_each_child_box_matching(Box& parent, Matcher matcher, Callback c
     parent.for_each_child_of_type<Box>([&](Box& child_box) {
         if (matcher(child_box))
             callback(child_box);
+        return IterationDecision::Continue;
     });
 }
 

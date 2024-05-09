@@ -731,6 +731,11 @@ bool PaintableBox::handle_mousewheel(Badge<EventHandler>, CSSPixelPoint, unsigne
 {
     if (!layout_box().is_user_scrollable())
         return false;
+
+    // TODO: Vertical and horizontal scroll overflow should be handled seperately.
+    if (!has_scrollable_overflow())
+        return false;
+
     scroll_by(wheel_delta_x, wheel_delta_y);
     return true;
 }
@@ -789,9 +794,9 @@ Optional<HitTestResult> PaintableBox::hit_test(CSSPixelPoint position, HitTestTy
     (void)PaintableBox::hit_test(position, type, [&](HitTestResult candidate) {
         VERIFY(!result.has_value());
         if (!candidate.paintable->visible_for_hit_testing())
-            return Painting::TraversalDecision::Continue;
+            return TraversalDecision::Continue;
         result = move(candidate);
-        return Painting::TraversalDecision::Break;
+        return TraversalDecision::Break;
     });
     return result;
 }
